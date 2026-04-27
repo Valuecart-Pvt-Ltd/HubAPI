@@ -362,7 +362,8 @@ BEGIN
 
     -- MOM items (if session exists)
     SELECT mi.id, mi.serial_number, mi.category, mi.action_item,
-           mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id
+           mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id,
+           mi.kaarya_card_id
     FROM   mom_items mi
     JOIN   mom_sessions ms ON ms.id = mi.mom_session_id
     WHERE  ms.event_id = @EventId
@@ -847,7 +848,8 @@ BEGIN
 
     -- Items for that session
     SELECT mi.id, mi.serial_number, mi.category, mi.action_item,
-           mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id
+           mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id,
+           mi.kaarya_card_id
     FROM   mom_items mi
     WHERE  mi.mom_session_id = (
                SELECT TOP 1 id FROM mom_sessions
@@ -1014,9 +1016,10 @@ BEGIN
         updated_at  = GETUTCDATE()
     WHERE id = @ItemId;
 
-    -- Return updated item + context for Trello/activity caller
+    -- Return updated item + context for activity log + Kaarya sync caller
     SELECT mi.id, mi.serial_number, mi.category, mi.action_item,
            mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id,
+           mi.kaarya_card_id,
            @SessionId     AS mom_session_id,
            @OldStatus     AS old_status,
            @OldActionItem AS old_action_item,

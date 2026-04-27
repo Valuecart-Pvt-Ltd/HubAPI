@@ -68,6 +68,7 @@ interface MomItemRow {
   status:          'pending' | 'in-progress' | 'completed'
   trello_card_id:  string | null
   trello_board_id: string | null
+  kaarya_card_id:  string | null
 }
 
 interface RawItemInput {
@@ -90,6 +91,7 @@ function formatItem(r: MomItemRow) {
     status:         r.status,
     trelloCardId:   r.trello_card_id,
     trelloBoardId:  r.trello_board_id,
+    kaaryaCardId:   r.kaarya_card_id,
   }
 }
 
