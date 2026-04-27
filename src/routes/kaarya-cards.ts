@@ -275,6 +275,7 @@ cardsRouter.post('/cards/:cardId/members', requireAuth, async (req: AuthRequest,
       UserId:  { type: sql.UniqueIdentifier, value: userId },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    void emitCardChange(req.params.cardId, 'card:members-changed')
     res.status(201).json({ success: true, data: rows[0] ?? null })
   } catch (err) { next(err) }
 })
@@ -286,6 +287,7 @@ cardsRouter.delete('/cards/:cardId/members/:userId', requireAuth, async (req: Au
       UserId:  { type: sql.UniqueIdentifier, value: req.params.userId },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    void emitCardChange(req.params.cardId, 'card:members-changed')
     res.json({ success: true, data: null })
   } catch (err) { next(err) }
 })
@@ -304,6 +306,7 @@ cardsRouter.post('/cards/:cardId/labels', requireAuth, async (req: AuthRequest, 
       LabelId: { type: sql.UniqueIdentifier, value: labelId },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    void emitCardChange(req.params.cardId, 'card:labels-changed')
     res.status(201).json({ success: true, data: rows[0] ?? null })
   } catch (err) { next(err) }
 })
@@ -315,6 +318,27 @@ cardsRouter.delete('/cards/:cardId/labels/:labelId', requireAuth, async (req: Au
       LabelId: { type: sql.UniqueIdentifier, value: req.params.labelId },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    void emitCardChange(req.params.cardId, 'card:labels-changed')
     res.json({ success: true, data: null })
   } catch (err) { next(err) }
 })
+
+// ─── Helper: emit a board-room event for any card mutation ───────────────────
+//
+// Resolves board_id from the card and broadcasts on `board:<boardId>` so every
+// open client invalidates its cache.
+
+import { query } from '../db'
+
+async function emitCardChange(cardId: string, event: string): Promise<void> {
+  try {
+    const rows = await query<{ board_id: string }>(
+      'SELECT board_id FROM kaarya_cards WHERE id = @id',
+      { id: { type: sql.UniqueIdentifier, value: cardId } },
+    )
+    const boardId = rows[0]?.board_id
+    if (boardId) ioRef.io?.to(`board:${boardId}`).emit(event, { cardId })
+  } catch (err) {
+    console.warn(`[realtime] ${event} emit skipped:`, (err as Error).message)
+  }
+}

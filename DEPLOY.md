@@ -209,9 +209,11 @@ For higher fidelity, redirect stdout/stderr to a date-rotated file by adding a
 small `logger.ts` and piping via `pino-rotating-file` — out of scope for now;
 console output via iisnode is sufficient for the Phase 5 launch.
 
-## Hardening already in place (Phase 5)
+## Hardening in place
 
-- `helmet()` baseline security headers.
+- `helmet()` baseline security headers **with CSP enabled** — `default-src
+  'self'`, `script-src 'self'` (no inline JS), `style-src 'self'
+  'unsafe-inline'` (React inline styles), `connect-src 'self' ws: wss:`.
 - `app.set('trust proxy', 1)` so `req.ip` reflects the real client behind IIS.
 - `express-rate-limit` on `/api/auth/login` and `/api/auth/register` — 20 req
   per 15 min per IP.
@@ -222,11 +224,46 @@ console output via iisnode is sufficient for the Phase 5 launch.
   TLS is on by default. For prod, install a real CA cert and flip
   `DB_TRUST_CERT=false`.
 
-## Hardening still TODO (post-launch)
+## Application Insights (opt-in)
 
-- **CSP headers** — currently disabled in `helmet` because the bundle uses
-  inline styles via Tailwind. Add a nonce-based CSP in a follow-up.
-- **Dedicated migration login** — the deploy uses `db_owner`; for stricter
-  prod, split into a `karya_migrate` (DDL) and `karya_app` (DML only).
-- **Backup schedule** — set up SQL Server scheduled backups + offsite copy.
-- **Application Insights / OpenTelemetry** — wire up real APM.
+Set the connection string and AI auto-instruments incoming HTTP, outgoing
+HTTP, console logs, and exceptions. No code change needed:
+
+```powershell
+# In the App Pool's environment variables:
+APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...;IngestionEndpoint=https://...
+```
+
+Restart the pool. Look for `[apm] Application Insights enabled` in the iisnode
+log on next startup.
+
+## Backup automation
+
+```powershell
+# One-time, elevated:
+cd C:\inetpub\HubAPI\src\db\scripts
+.\setup-backup.ps1
+
+# Verify by running it once now:
+Start-ScheduledTask -TaskName 'Karya nightly backup'
+Get-Content C:\backups\karya\backup.log -Tail 30
+```
+
+`setup-backup.ps1` registers a daily 02:30 task that runs `backup.sql`. The
+SQL script writes a date-stamped `.bak` file to `C:\backups\karya\` and prunes
+anything older than 14 days. Edit either file in place to tune the directory,
+schedule, or retention.
+
+For offsite copies, add a second action to the scheduled task that uploads
+the day's `.bak` to your blob/SFTP/S3 destination. Out of scope for the
+included script.
+
+## Hardening still TODO
+
+- **Dedicated migration login** — current deploy uses `db_owner`; for
+  stricter prod, split into a `karya_migrate` (DDL) and `karya_app` (DML
+  only).
+- **Stricter CSP** — current policy allows `'unsafe-inline'` for styles to
+  accommodate React's inline-style props. A future version using a hashed
+  or nonce-based policy would close the last gap.
+- **Subresource Integrity (SRI)** for the bundle — Vite has plugins for this.

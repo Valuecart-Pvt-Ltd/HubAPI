@@ -27,6 +27,7 @@ const FILES = [
   'mssql/05_kaarya_integration.sql',
   'mssql/06_kaarya_polish.sql',
   'mssql/07_kaarya_board_polish.sql',
+  'mssql/08_kaarya_phase6.sql',
 ]
 
 function splitOnGo(text: string): string[] {

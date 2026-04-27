@@ -1,6 +1,7 @@
 import { Router } from 'express'
-import { execSP, execSPMulti, sql } from '../db'
+import { execSP, execSPMulti, query, sql } from '../db'
 import { requireAuth, AuthRequest } from '../middleware/auth'
+import { ioRef } from '../io'
 
 export const boardsRouter = Router()
 
@@ -95,6 +96,28 @@ boardsRouter.get('/boards/:boardId/activity', requireAuth, async (req: AuthReque
   } catch (err) { next(err) }
 })
 
+// ─── Phase 6 — list reorder ──────────────────────────────────────────────────
+
+boardsRouter.post('/lists/:listId/move', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { position } = req.body as { position?: number }
+    if (typeof position !== 'number') {
+      res.status(400).json({ success: false, error: 'position is required', code: 'missing_position', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KMoveList', {
+      ListId:   { type: sql.UniqueIdentifier, value: req.params.listId },
+      Position: { type: sql.Int,              value: position },
+      ActorId:  { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    const list = rows[0] as { board_id?: string } | undefined
+    if (list?.board_id) {
+      ioRef.io?.to(`board:${list.board_id}`).emit('list:moved', list)
+    }
+    res.json({ success: true, data: list ?? null })
+  } catch (err) { next(err) }
+})
+
 // ─── Phase 4d — Board labels catalog ─────────────────────────────────────────
 
 boardsRouter.get('/boards/:boardId/labels', requireAuth, async (req: AuthRequest, res, next) => {
@@ -120,16 +143,25 @@ boardsRouter.post('/boards/:boardId/labels', requireAuth, async (req: AuthReques
       Color:   { type: sql.NVarChar(20),     value: color },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    ioRef.io?.to(`board:${req.params.boardId}`).emit('labels:changed', rows[0])
     res.status(201).json({ success: true, data: rows[0] })
   } catch (err) { next(err) }
 })
 
 boardsRouter.delete('/labels/:labelId', requireAuth, async (req: AuthRequest, res, next) => {
   try {
+    // Look up the board_id BEFORE delete so we can emit on the right room.
+    const lookup = await query<{ board_id: string }>(
+      'SELECT board_id FROM kaarya_labels WHERE id = @id',
+      { id: { type: sql.UniqueIdentifier, value: req.params.labelId } },
+    )
+    const boardId = lookup[0]?.board_id
+
     await execSP('usp_KDeleteLabel', {
       LabelId: { type: sql.UniqueIdentifier, value: req.params.labelId },
       ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
     })
+    if (boardId) ioRef.io?.to(`board:${boardId}`).emit('labels:changed', { deletedId: req.params.labelId })
     res.json({ success: true, data: null })
   } catch (err) { next(err) }
 })

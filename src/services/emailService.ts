@@ -519,3 +519,54 @@ export async function sendEventInviteEmail(opts: EventInviteOptions): Promise<vo
 
   console.log(`[email] ${inviteLabel} sent to ${allEmails.length} recipients for "${opts.title}"`)
 }
+
+// ─── Workspace invitation (Kaarya, Phase 6) ──────────────────────────────────
+
+interface WorkspaceInvitationOptions {
+  to:             string
+  workspaceName:  string
+  inviterName:    string
+  acceptUrl:      string
+  expiresAt:      Date
+}
+
+export async function sendWorkspaceInvitationEmail(opts: WorkspaceInvitationOptions): Promise<void> {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER) {
+    console.warn('[email] SMTP not configured — skipping invitation email')
+    return
+  }
+  const transporter = createTransporter()
+
+  const expiresStr = opts.expiresAt.toUTCString()
+  const subject = `${opts.inviterName} invited you to "${opts.workspaceName}" on Kaarya`
+
+  const html = `
+<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#2D2361;max-width:520px;margin:0 auto;padding:24px">
+  <p style="font-size:11px;font-weight:bold;color:#F0841C;letter-spacing:.08em">VALUECART KAARYA</p>
+  <h1 style="font-size:22px;margin:8px 0 16px">You've been invited to <span style="color:#F0841C">${escapeInviteHtml(opts.workspaceName)}</span></h1>
+  <p style="font-size:14px;line-height:1.6">${escapeInviteHtml(opts.inviterName)} has invited you to join their Kaarya workspace.</p>
+  <p style="margin:24px 0">
+    <a href="${opts.acceptUrl}" style="display:inline-block;padding:12px 24px;background:#1F2937;color:#fff;text-decoration:none;border-radius:6px;font-weight:600">Accept invitation</a>
+  </p>
+  <p style="font-size:12px;color:#6B7280">Or paste this link into your browser:<br/><span style="word-break:break-all">${opts.acceptUrl}</span></p>
+  <p style="font-size:12px;color:#9CA3AF;margin-top:24px">This invitation expires on ${expiresStr}.</p>
+</div>`.trim()
+
+  await transporter.sendMail({
+    from:    process.env.SMTP_USER,
+    to:      opts.to,
+    subject,
+    html,
+  })
+
+  console.log(`[email] workspace invitation sent to ${opts.to}`)
+}
+
+function escapeInviteHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}

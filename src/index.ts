@@ -4,6 +4,24 @@ import { resolve } from 'path'
 // invoked from. __dirname here is src/, so one level up = repo root.
 loadEnv({ path: resolve(__dirname, '..', '.env') })
 
+// ─── Application Insights (opt-in via env var) ───────────────────────────────
+// Setting APPLICATIONINSIGHTS_CONNECTION_STRING auto-instruments the Express
+// app: incoming HTTP, outgoing HTTP, console logs, exceptions. No data leaves
+// the process until the env var is set, so this is safe in dev.
+if (process.env.APPLICATIONINSIGHTS_CONNECTION_STRING) {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const ai = require('applicationinsights') as typeof import('applicationinsights')
+  ai.setup()
+    .setAutoCollectConsole(true, true)
+    .setAutoCollectExceptions(true)
+    .setAutoCollectPerformance(true, true)
+    .setAutoCollectRequests(true)
+    .setAutoCollectDependencies(true)
+    .setSendLiveMetrics(false)
+    .start()
+  console.log('[apm] Application Insights enabled')
+}
+
 import http from 'http'
 import express from 'express'
 import cors from 'cors'
@@ -45,11 +63,24 @@ app.set('trust proxy', 1)
 // ─── Global middleware ────────────────────────────────────────────────────────
 
 app.use(helmet({
-  // The Hub frontend talks to us same-origin (via IIS URL Rewrite) in prod, and
-  // cross-origin in local dev. CORS handles the actual policy; helmet gives us
-  // the security-headers baseline. CSP is OPT-IN — the Hub bundle uses inline
-  // styles via Tailwind so a strict CSP would need nonces; revisit later.
-  contentSecurityPolicy:    false,
+  // CSP allows inline styles only — required because React props like
+  // style={{ background: ... }} produce inline style attributes. Inline
+  // scripts remain forbidden, so XSS vectors via injected <script> are
+  // still blocked.
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'self'"],
+      styleSrc:   ["'self'", "'unsafe-inline'"],
+      imgSrc:     ["'self'", 'data:', 'https:'],
+      fontSrc:    ["'self'", 'data:'],
+      connectSrc: ["'self'", 'ws:', 'wss:'],
+      frameAncestors: ["'self'"],
+      objectSrc:      ["'none'"],
+      baseUri:        ["'self'"],
+    },
+  },
   crossOriginResourcePolicy: { policy: 'cross-origin' },  // for socket.io upgrades
   crossOriginEmbedderPolicy: false,
 }))
