@@ -43,11 +43,12 @@ BEGIN
         microsoft_refresh_token NVARCHAR(MAX)    NULL,
         microsoft_token_expiry  DATETIME2        NULL,
         created_at              DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
-        CONSTRAINT UQ_users_email     UNIQUE (email),
-        CONSTRAINT UQ_users_google_id UNIQUE (google_id)
+        CONSTRAINT UQ_users_email UNIQUE (email)
     );
-    CREATE INDEX IX_users_email     ON users (email);
-    CREATE INDEX IX_users_google_id ON users (google_id);
+    CREATE INDEX IX_users_email ON users (email);
+    -- Filtered UNIQUE index: enforce uniqueness only for non-NULL google_id.
+    -- (Plain UNIQUE in MSSQL treats NULLs as equal, blocking >1 email/password user.)
+    CREATE UNIQUE INDEX UX_users_google_id ON users (google_id) WHERE google_id IS NOT NULL;
     PRINT 'Created table: users';
 END
 GO
@@ -91,12 +92,15 @@ BEGIN
         trello_board_name  NVARCHAR(500)    NULL,
         reminder_sent_at   DATETIME2        NULL,              -- migration 007
         created_at         DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
-        updated_at         DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
-        CONSTRAINT UQ_events_google_event_id UNIQUE (google_event_id)
+        updated_at         DATETIME2        NOT NULL DEFAULT GETUTCDATE()
     );
-    CREATE INDEX IX_events_organizer      ON events (organizer_email);
-    CREATE INDEX IX_events_start_time     ON events (start_time);
-    CREATE INDEX IX_events_google_event   ON events (google_event_id);
+    CREATE INDEX IX_events_organizer  ON events (organizer_email);
+    CREATE INDEX IX_events_start_time ON events (start_time);
+    -- Filtered UNIQUE: a manually-created event has google_event_id = NULL and
+    -- multiple of those must be allowed. Only Google-imported events get the
+    -- uniqueness check.
+    CREATE UNIQUE INDEX UX_events_google_event_id ON events (google_event_id)
+      WHERE google_event_id IS NOT NULL;
     PRINT 'Created table: events';
 END
 GO
@@ -167,6 +171,7 @@ BEGIN
         trello_card_id          NVARCHAR(255)    NULL,
         trello_board_id         NVARCHAR(255)    NULL,
         trello_checklist_item_id NVARCHAR(255)   NULL,          -- migration 006
+        kaarya_card_id          UNIQUEIDENTIFIER NULL,           -- Phase 3 back-pointer (also ALTERed in 05)
         created_at              DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
         updated_at              DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
         CONSTRAINT UQ_mom_items_session_serial UNIQUE (mom_session_id, serial_number),
