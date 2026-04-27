@@ -19,7 +19,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import sql from 'mssql'
 
-const FILES = ['mssql/01_tables.sql', 'mssql/02_stored_procedures.sql']
+const FILES = [
+  'mssql/01_tables.sql',
+  'mssql/02_stored_procedures.sql',
+  'mssql/03_kaarya_tables.sql',
+  'mssql/04_kaarya_procedures.sql',
+]
 
 function splitOnGo(text: string): string[] {
   // Strip BOM, normalise line endings, then split on standalone `GO` (case-insensitive).

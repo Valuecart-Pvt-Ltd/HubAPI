@@ -22,8 +22,14 @@ import { ordersRouter }   from './routes/orders'
 import { eventsRouter }   from './routes/events'
 import { momRouter }      from './routes/mom'
 import { webhookRouter }  from './routes/webhooks'
+// Kaarya routers (Phase 1 — task boards live in the same backend as Karya
+// and share the JWT, the DB pool, and the socket.io server)
+import { workspacesRouter as kaaryaWorkspacesRouter } from './routes/kaarya-workspaces'
+import { boardsRouter     as kaaryaBoardsRouter }     from './routes/kaarya-boards'
+import { cardsRouter      as kaaryaCardsRouter }      from './routes/kaarya-cards'
 import { errorHandler }   from './middleware/errorHandler'
 import { startCalendarSyncCron } from './services/calendarService'
+import { ioRef }          from './io'
 import type { AuthTokenPayload } from './types/shared'
 
 const app  = express()
@@ -37,13 +43,19 @@ app.use(passport.initialize())
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.use('/api/auth',     authRouter)
-app.use('/api/products', productsRouter)
-app.use('/api/cart',     cartRouter)
-app.use('/api/orders',   ordersRouter)
-app.use('/api/events',   eventsRouter)
-app.use('/api/mom',      momRouter)
-app.use('/api/webhooks', webhookRouter)
+app.use('/api/auth',       authRouter)
+app.use('/api/products',   productsRouter)
+app.use('/api/cart',       cartRouter)
+app.use('/api/orders',     ordersRouter)
+app.use('/api/events',     eventsRouter)
+app.use('/api/mom',        momRouter)
+app.use('/api/webhooks',   webhookRouter)
+
+// Kaarya routes — separate URL space from Karya, same JWT auth, same db pool.
+// /api/workspaces, /api/boards/:id, /api/lists/:id/cards, /api/cards/:id, etc.
+app.use('/api/workspaces', kaaryaWorkspacesRouter)
+app.use('/api',            kaaryaBoardsRouter)
+app.use('/api',            kaaryaCardsRouter)
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
@@ -55,18 +67,19 @@ app.use(errorHandler)
 
 // ─── HTTP + Socket.IO server ─────────────────────────────────────────────────
 //
-// Phase 0 scaffolding: the server upgrades to socket.io for live updates.
 // Authentication uses the same JWT (HS256) that secures the REST API, so the
-// token issued at /api/auth/login or /api/auth/google/callback also unlocks
-// the socket. Phase 3 will use this to push card / MOM mutations to clients.
+// token issued at /api/auth/login or /api/auth/google/callback unlocks the
+// socket for both Karya (event:* rooms) and Kaarya (board:* rooms) updates.
 
 const server = http.createServer(app)
 
-export const io = new SocketServer(server, {
+const io = new SocketServer(server, {
   cors:        { origin: CLIENT_ORIGINS, credentials: true },
   path:        '/socket.io',
   pingTimeout: 30_000,
 })
+ioRef.io = io
+export { io }
 
 io.use((socket, next) => {
   const token = (socket.handshake.auth?.token as string)
@@ -84,18 +97,21 @@ io.use((socket, next) => {
 })
 
 io.on('connection', (socket: Socket & { user?: AuthTokenPayload }) => {
-  // Each authenticated user joins a personal room — useful for direct pushes.
   if (socket.user) socket.join(`user:${socket.user.userId}`)
 
-  // Clients can subscribe/unsubscribe to event-detail rooms for live MOM updates.
+  // Karya — event-detail rooms for live MOM updates
   socket.on('event:join',  (eventId: string) => { if (eventId) socket.join(`event:${eventId}`) })
   socket.on('event:leave', (eventId: string) => { if (eventId) socket.leave(`event:${eventId}`) })
+
+  // Kaarya — board rooms for live card-mutation broadcasts
+  socket.on('board:join',  (boardId: string) => { if (boardId) socket.join(`board:${boardId}`) })
+  socket.on('board:leave', (boardId: string) => { if (boardId) socket.leave(`board:${boardId}`) })
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
-  console.log(`HubAPI listening on http://localhost:${PORT}  (socket.io enabled)`)
+  console.log(`HubAPI listening on http://localhost:${PORT}  (socket.io enabled — Karya + Kaarya)`)
   startCalendarSyncCron()
 })
 
