@@ -572,3 +572,86 @@ eventsRouter.patch('/:eventId', async (req: AuthRequest, res, next) => {
     next(err)
   }
 })
+
+// ─── Phase 3 — Kaarya integration ─────────────────────────────────────────────
+//
+// Three endpoints power the "this event's MOM items live on Kaarya board X" UX:
+//   GET    /:eventId/kaarya-board   → current mapping (board + list, both optional)
+//   PATCH  /:eventId/kaarya-board   → set or clear the mapping
+//   POST   /:eventId/sync-kaarya    → manual re-sync of the latest MOM session
+
+eventsRouter.get('/:eventId/kaarya-board', async (req: AuthRequest, res, next) => {
+  try {
+    const rows = await query<{
+      kaarya_board_id: string | null
+      kaarya_list_id:  string | null
+      board_name:      string | null
+      board_color:     string | null
+      list_name:       string | null
+      list_color:      string | null
+    }>(
+      `SELECT e.kaarya_board_id, e.kaarya_list_id,
+              b.name  AS board_name, b.color AS board_color,
+              l.name  AS list_name,  l.color AS list_color
+       FROM   events e
+       LEFT JOIN kaarya_boards b ON b.id = e.kaarya_board_id
+       LEFT JOIN kaarya_lists  l ON l.id = e.kaarya_list_id
+       WHERE  e.id = @eventId`,
+      { eventId: { type: sql.UniqueIdentifier, value: req.params.eventId } },
+    )
+    const row = rows[0]
+    if (!row) {
+      res.status(404).json({ success: false, error: 'Event not found', code: 'not_found', statusCode: 404 })
+      return
+    }
+    res.json({
+      success: true,
+      data: {
+        boardId:   row.kaarya_board_id,
+        listId:    row.kaarya_list_id,
+        boardName: row.board_name,
+        boardColor:row.board_color,
+        listName:  row.list_name,
+        listColor: row.list_color,
+      },
+    })
+  } catch (err) { next(err) }
+})
+
+eventsRouter.patch('/:eventId/kaarya-board', async (req: AuthRequest, res, next) => {
+  try {
+    const { boardId, listId } = req.body as {
+      boardId?: string | null
+      listId?:  string | null
+    }
+    const rows = await execSP('usp_KSetEventBoard', {
+      EventId:       { type: sql.UniqueIdentifier, value: req.params.eventId },
+      KaaryaBoardId: { type: sql.UniqueIdentifier, value: boardId ?? null },
+      KaaryaListId:  { type: sql.UniqueIdentifier, value: listId  ?? null },
+      ActorId:       { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: rows[0] ?? null })
+  } catch (err) { next(err) }
+})
+
+eventsRouter.post('/:eventId/sync-kaarya', async (req: AuthRequest, res, next) => {
+  try {
+    const rows = await execSP('usp_KSyncEventMom', {
+      EventId: { type: sql.UniqueIdentifier, value: req.params.eventId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: { syncedCount: rows.length, cards: rows } })
+  } catch (err) { next(err) }
+})
+
+// Helper for the Event-Detail board picker — list the lists of a board the
+// caller can access. Avoids forcing the UI to fetch the entire board detail.
+eventsRouter.get('/kaarya/boards/:boardId/lists', async (req: AuthRequest, res, next) => {
+  try {
+    const rows = await execSP('usp_KGetBoardLists', {
+      BoardId: { type: sql.UniqueIdentifier, value: req.params.boardId },
+      UserId:  { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: rows })
+  } catch (err) { next(err) }
+})

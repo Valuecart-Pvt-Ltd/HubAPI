@@ -2,18 +2,58 @@ import { Router } from 'express'
 import { execSP, execSPMulti, query, sql } from '../db'
 import { requireAuth, AuthRequest } from '../middleware/auth'
 import { sendMomFinalizedEmail } from '../services/emailService'
+import { ioRef } from '../io'
 
 export const momRouter = Router()
 momRouter.use(requireAuth)
 
-// ─── Trello compatibility shim ────────────────────────────────────────────────
-// Trello has been removed from this project. The MOM module previously fired
-// non-fatal Trello side-effects on item changes; replace each call with a
-// no-op log so existing code paths still compile and behave consistently.
+// ─── Kaarya sync helpers (Phase 3) ────────────────────────────────────────────
+// MOM saves and item edits propagate to Kaarya cards on the event's mapped
+// board. All sync calls are best-effort — never block the request on them.
 
-function trelloRemoved(op: string): Promise<void> {
-  console.log(`[trello-removed] ${op} — this op is now handled by Kaarya integration in Phase 3`)
-  return Promise.resolve()
+function syncMomToKaarya(eventId: string, actorId: string): void {
+  void execSP('usp_KSyncEventMom', {
+    EventId: { type: sql.UniqueIdentifier, value: eventId },
+    ActorId: { type: sql.UniqueIdentifier, value: actorId },
+  })
+    .then(rows => {
+      // Notify any board-room listeners that cards on those boards changed.
+      const io = ioRef.io
+      if (!io || rows.length === 0) return
+      const boardIds = new Set<string>()
+      for (const r of rows) {
+        const bid = (r as { board_id?: string }).board_id
+        if (bid) boardIds.add(bid)
+      }
+      for (const bid of boardIds) io.to(`board:${bid}`).emit('card:synced', { eventId })
+    })
+    .catch(err => {
+      // NO_LIST_AVAILABLE / FORBIDDEN here are real warnings; everything else
+      // is logged for postmortem but never bubbled.
+      console.warn(`[kaarya-sync] event=${eventId} skipped:`, (err as Error).message)
+    })
+}
+
+function unsyncMomItemFromKaarya(itemId: string, actorId: string): void {
+  void execSP('usp_KUnsyncMomItem', {
+    MomItemId: { type: sql.UniqueIdentifier, value: itemId },
+    ActorId:   { type: sql.UniqueIdentifier, value: actorId },
+  }).catch(err => {
+    console.warn(`[kaarya-sync] unsync item=${itemId} skipped:`, (err as Error).message)
+  })
+}
+
+async function syncMomBySessionId(sessionId: string, actorId: string): Promise<void> {
+  // usp_UpdateMOMItem returns mom_session_id; resolve event_id, then bulk sync.
+  try {
+    const rows = await query<{ event_id: string }>(
+      'SELECT event_id FROM mom_sessions WHERE id = @id',
+      { id: { type: sql.UniqueIdentifier, value: sessionId } },
+    )
+    if (rows[0]) syncMomToKaarya(rows[0].event_id, actorId)
+  } catch (err) {
+    console.warn(`[kaarya-sync] resolve session=${sessionId} skipped:`, (err as Error).message)
+  }
 }
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -246,14 +286,11 @@ momRouter.patch('/item/:itemId', async (req: AuthRequest, res, next) => {
     const oldStatus     = item.old_status
     const oldActionItem = item.old_action_item
 
-    // ── Trello sync removed — log no-op ──────────────────────────────────────
-    if (item.trello_card_id_hint) {
-      if (status !== undefined && status !== oldStatus) {
-        trelloRemoved('updateCardStatus')
-      }
-      if (actionItem !== undefined && actionItem.trim() !== oldActionItem) {
-        trelloRemoved('updateCardName')
-      }
+    // ── Kaarya sync — push the item-level edit through if event has a board mapped ──
+    const statusChanged = status !== undefined && status !== oldStatus
+    const titleChanged  = actionItem !== undefined && actionItem.trim() !== oldActionItem
+    if (statusChanged || titleChanged) {
+      void syncMomBySessionId(item.mom_session_id, req.user!.userId)
     }
 
     // ── Activity logging ──────────────────────────────────────────────────────
@@ -328,10 +365,8 @@ momRouter.delete('/item/:itemId', async (req: AuthRequest, res, next) => {
       return
     }
 
-    // Trello archive removed — log no-op
-    if (ctx.trello_card_id) {
-      trelloRemoved('archiveCard')
-    }
+    // Kaarya: drop the corresponding card too (no-op if event has no board mapped).
+    unsyncMomItemFromKaarya(itemId, req.user!.userId)
 
     // Activity log (non-fatal)
     logActivity(ctx.mom_session_id, userEmail, 'item_deleted', {
@@ -426,9 +461,11 @@ momRouter.post('/', async (req: AuthRequest, res, next) => {
     const isNew           = flags[0].is_new === 1
     const wasAlreadyFinal = flags[0].was_already_final === 1
 
-    // ── Trello sync removed — only emit email + activity on draft→final ──────
+    // ── Kaarya sync — push every save through (idempotent: existing cards just refresh) ──
+    syncMomToKaarya(eventId, userId)
+
+    // ── Email attendees on draft→final ──────────────────────────────────────
     if (status === 'final' && !wasAlreadyFinal) {
-      trelloRemoved('syncMOMToTrello')
 
       // ── Email all attendees ─────────────────────────────────────────────────
       ;(async () => {
