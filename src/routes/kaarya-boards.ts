@@ -94,3 +94,27 @@ boardsRouter.get('/boards/:boardId/activity', requireAuth, async (req: AuthReque
     res.json({ success: true, data: rows })
   } catch (err) { next(err) }
 })
+
+// ─── Phase 4b — board analytics (5 recordsets in one round-trip) ─────────────
+
+boardsRouter.get('/boards/:boardId/analytics', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const result = await execSPMulti('usp_KGetBoardAnalytics', {
+      BoardId: { type: sql.UniqueIdentifier, value: req.params.boardId },
+      UserId:  { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    const recordsets = result.recordsets as unknown as Record<string, unknown>[][]
+    const [headlineRows, byPriority, byList, topAssignees, completionTimeline] = recordsets
+
+    res.json({
+      success: true,
+      data: {
+        headline:           headlineRows?.[0] ?? null,
+        byPriority:         byPriority         ?? [],
+        byList:             byList             ?? [],
+        topAssignees:       topAssignees       ?? [],
+        completionTimeline: completionTimeline ?? [],
+      },
+    })
+  } catch (err) { next(err) }
+})

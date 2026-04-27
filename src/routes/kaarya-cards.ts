@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { execSP, sql } from '../db'
+import { execSP, execSPMulti, sql } from '../db'
 import { requireAuth, AuthRequest } from '../middleware/auth'
 import { ioRef } from '../io'
 
@@ -144,5 +144,119 @@ cardsRouter.post('/cards/:cardId/comments', requireAuth, async (req: AuthRequest
       Body:     { type: sql.NVarChar(sql.MAX), value: body.trim() },
     })
     res.status(201).json({ success: true, data: rows[0] })
+  } catch (err) { next(err) }
+})
+
+// ─── Phase 4b — full card detail (one round-trip for the modal) ──────────────
+
+cardsRouter.get('/cards/:cardId/detail', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const result = await execSPMulti('usp_KGetCardDetail', {
+      CardId: { type: sql.UniqueIdentifier, value: req.params.cardId },
+      UserId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    const recordsets = result.recordsets as unknown as Record<string, unknown>[][]
+    const [cardRows, comments, tasks, members, labels] = recordsets
+
+    if (!cardRows || cardRows.length === 0) {
+      res.status(404).json({ success: false, error: 'Card not found', code: 'not_found', statusCode: 404 })
+      return
+    }
+
+    const c = cardRows[0]
+    const recurrence = c.recurrence_frequency
+      ? {
+          frequency:       c.recurrence_frequency,
+          intervalCount:   c.recurrence_interval,
+          nextDueAt:       c.recurrence_next_due_at,
+          lastCompletedAt: c.recurrence_last_completed_at,
+          completionCount: c.recurrence_completion_count,
+        }
+      : null
+
+    res.json({
+      success: true,
+      data: {
+        card:       c,
+        comments:   comments ?? [],
+        tasks:      tasks    ?? [],
+        members:    members  ?? [],
+        labels:     labels   ?? [],
+        recurrence,
+      },
+    })
+  } catch (err) { next(err) }
+})
+
+// ─── Phase 4b — recurrence (set / clear) ─────────────────────────────────────
+
+cardsRouter.put('/cards/:cardId/recurrence', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { frequency, intervalCount, nextDueAt } = req.body as {
+      frequency?:     'daily' | 'weekly' | 'monthly'
+      intervalCount?: number
+      nextDueAt?:     string
+    }
+    if (!frequency || !['daily', 'weekly', 'monthly'].includes(frequency)) {
+      res.status(400).json({ success: false, error: 'frequency must be daily/weekly/monthly', code: 'bad_frequency', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KSetCardRecurrence', {
+      CardId:        { type: sql.UniqueIdentifier, value: req.params.cardId },
+      ActorId:       { type: sql.UniqueIdentifier, value: req.user!.userId },
+      Frequency:     { type: sql.NVarChar(20),     value: frequency },
+      IntervalCount: { type: sql.Int,              value: intervalCount ?? 1 },
+      NextDueAt:     { type: sql.DateTime2,        value: nextDueAt ? new Date(nextDueAt) : null },
+    })
+    res.json({ success: true, data: rows[0] ?? null })
+  } catch (err) { next(err) }
+})
+
+cardsRouter.delete('/cards/:cardId/recurrence', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    await execSP('usp_KClearCardRecurrence', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: null })
+  } catch (err) { next(err) }
+})
+
+// ─── Phase 4b — subtask CRUD ─────────────────────────────────────────────────
+
+cardsRouter.post('/cards/:cardId/tasks', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { text } = req.body as { text?: string }
+    if (!text || !text.trim()) {
+      res.status(400).json({ success: false, error: 'text is required', code: 'missing_text', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KAddCardTask', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+      Text:    { type: sql.NVarChar(1000),   value: text.trim() },
+    })
+    res.status(201).json({ success: true, data: rows[0] })
+  } catch (err) { next(err) }
+})
+
+cardsRouter.patch('/tasks/:taskId', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { done } = req.body as { done?: boolean }
+    const rows = await execSP('usp_KToggleCardTask', {
+      TaskId:  { type: sql.UniqueIdentifier, value: req.params.taskId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+      Done:    { type: sql.Bit,              value: done ? 1 : 0 },
+    })
+    res.json({ success: true, data: rows[0] })
+  } catch (err) { next(err) }
+})
+
+cardsRouter.delete('/tasks/:taskId', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    await execSP('usp_KDeleteCardTask', {
+      TaskId: { type: sql.UniqueIdentifier, value: req.params.taskId },
+    })
+    res.json({ success: true, data: { id: req.params.taskId } })
   } catch (err) { next(err) }
 })
