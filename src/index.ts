@@ -7,6 +7,8 @@ loadEnv({ path: resolve(__dirname, '..', '.env') })
 import http from 'http'
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import jwt from 'jsonwebtoken'
 import { Server as SocketServer, Socket } from 'socket.io'
 
@@ -35,11 +37,38 @@ import type { AuthTokenPayload } from './types/shared'
 const app  = express()
 const PORT = process.env.PORT ?? 4000
 
+// ─── Behind-proxy / IIS configuration ─────────────────────────────────────────
+// Under iisnode the request arrives over a Named Pipe. Express needs to be told
+// to trust forwarded headers so req.ip + req.protocol reflect the real client.
+app.set('trust proxy', 1)
+
 // ─── Global middleware ────────────────────────────────────────────────────────
 
+app.use(helmet({
+  // The Hub frontend talks to us same-origin (via IIS URL Rewrite) in prod, and
+  // cross-origin in local dev. CORS handles the actual policy; helmet gives us
+  // the security-headers baseline. CSP is OPT-IN — the Hub bundle uses inline
+  // styles via Tailwind so a strict CSP would need nonces; revisit later.
+  contentSecurityPolicy:    false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },  // for socket.io upgrades
+  crossOriginEmbedderPolicy: false,
+}))
 app.use(cors({ origin: CLIENT_ORIGINS, credentials: true }))
 app.use(express.json({ limit: '1mb' }))
 app.use(passport.initialize())
+
+// ─── Rate limiting on the auth endpoints ─────────────────────────────────────
+// Only /api/auth/login + /api/auth/register get throttled — calendar sync
+// and ordinary CRUD aren't worth limiting at this layer.
+const authLimiter = rateLimit({
+  windowMs:        15 * 60_000,             // 15 min
+  limit:           20,                      // per-IP per window
+  standardHeaders: 'draft-7',
+  legacyHeaders:   false,
+  message:         { success: false, error: 'Too many auth attempts, slow down', code: 'rate_limited', statusCode: 429 },
+})
+app.use('/api/auth/login',    authLimiter)
+app.use('/api/auth/register', authLimiter)
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 

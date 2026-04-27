@@ -8,7 +8,8 @@
     "start": "node dist/index.js",
     "migrate": "ts-node src/db/migrate.ts",
     "migrate:prod": "node dist/db/migrate.js",
-    "export:neon": "ts-node src/scripts/export-from-neon.ts"
+    "export:neon": "ts-node src/scripts/export-from-neon.ts",
+    "import:mssql": "ts-node src/scripts/import-to-mssql.ts"
   },
   "dependencies": {
     "@types/passport-microsoft": "^2.1.1",
@@ -18,7 +19,9 @@
     "date-fns": "^3.6.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^8.4.1",
     "googleapis": "^144.0.0",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mssql": "^11.0.1",
     "node-cron": "^3.0.3",
