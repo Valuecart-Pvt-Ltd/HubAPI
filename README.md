@@ -1,12 +1,18 @@
 # HubAPI
 
 Node.js + Express + TypeScript backend for the Valuecart Hub application.
+Serves both **Karya** (meetings + minutes) and **Kaarya** (task boards) from
+a single API and a shared MSSQL database.
+
+> **Operators:** start at [`RUNBOOK.md`](./RUNBOOK.md) for the production
+> story, or [`DEPLOY.md`](./DEPLOY.md) for the step-by-step IIS install.
 
 ## Stack
 
 - Node.js 20, Express 4, TypeScript
-- PostgreSQL (via `pg`) — Neon in production
+- MSSQL via the `mssql` package (TLS, connection pool)
 - Passport (Google + Microsoft OAuth)
+- Socket.IO for live MOM and card updates (JWT HS256 handshake)
 - googleapis for Calendar integration
 - node-cron for scheduled sync jobs
 
