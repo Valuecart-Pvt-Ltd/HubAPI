@@ -1,11 +1,20 @@
 import { Router } from 'express'
-import { query, withTransaction } from '../db'
+import { execSP, execSPMulti, query, sql } from '../db'
 import { requireAuth, AuthRequest } from '../middleware/auth'
-import { syncMOMToTrello, updateCardStatus, updateCardName, archiveCard } from '../services/trelloService'
 import { sendMomFinalizedEmail } from '../services/emailService'
 
 export const momRouter = Router()
 momRouter.use(requireAuth)
+
+// ─── Trello compatibility shim ────────────────────────────────────────────────
+// Trello has been removed from this project. The MOM module previously fired
+// non-fatal Trello side-effects on item changes; replace each call with a
+// no-op log so existing code paths still compile and behave consistently.
+
+function trelloRemoved(op: string): Promise<void> {
+  console.log(`[trello-removed] ${op} — this op is now handled by Kaarya integration in Phase 3`)
+  return Promise.resolve()
+}
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -52,11 +61,12 @@ async function logActivity(
   eventType:  'mom_created' | 'mom_finalized' | 'status_changed' | 'trello_synced' | 'item_edited' | 'item_deleted',
   details?:   Record<string, unknown>,
 ): Promise<void> {
-  await query(
-    `INSERT INTO mom_activity_log (session_id, actor_email, event_type, details)
-     VALUES ($1, $2, $3, $4)`,
-    [sessionId, actorEmail, eventType, details ? JSON.stringify(details) : null],
-  ).catch((err) => {
+  await execSP('usp_LogMOMActivity', {
+    SessionId:  { type: sql.UniqueIdentifier, value: sessionId },
+    ActorEmail: { type: sql.NVarChar(255),    value: actorEmail },
+    EventType:  { type: sql.NVarChar(50),     value: eventType },
+    Details:    { type: sql.NVarChar(sql.MAX), value: details ? JSON.stringify(details) : null },
+  }).catch((err) => {
     // Activity logging is non-fatal — never break a request for it
     console.error('[mom] logActivity error:', err)
   })
@@ -73,24 +83,18 @@ async function checkEventAccess(
   eventId:   string,
   userEmail: string,
 ): Promise<AccessInfo | null> {
-  const { rows } = await query<{
-    organizer_email:  string
-    is_attendee:      boolean
-  }>(
-    `SELECT e.organizer_email,
-       EXISTS(
-         SELECT 1 FROM event_attendees ea
-         WHERE ea.event_id = e.id AND ea.email = $2
-       ) AS is_attendee
-     FROM events e
-     WHERE e.id = $1`,
-    [eventId, userEmail],
+  const rows = await execSP<{ is_organizer: number; is_attendee: number }>(
+    'usp_CheckEventAccess',
+    {
+      EventId:   { type: sql.UniqueIdentifier, value: eventId },
+      UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+    },
   )
 
   if (!rows[0]) return null
 
-  const isOrganizer = rows[0].organizer_email === userEmail
-  const isAttendee  = rows[0].is_attendee
+  const isOrganizer = rows[0].is_organizer === 1
+  const isAttendee  = rows[0].is_attendee  === 1
 
   if (!isOrganizer && !isAttendee) return null
 
@@ -117,7 +121,7 @@ momRouter.get('/search', async (req: AuthRequest, res, next) => {
       return
     }
 
-    const { rows } = await query<
+    const rows = await execSP<
       MomItemRow & {
         mom_session_id: string
         session_status: 'draft' | 'final'
@@ -125,34 +129,10 @@ momRouter.get('/search', async (req: AuthRequest, res, next) => {
         event_title:    string
         event_start:    Date
       }
-    >(
-      `SELECT
-         mi.id, mi.serial_number, mi.category, mi.action_item,
-         mi.owner_email, mi.eta, mi.status, mi.trello_card_id,
-         ms.id            AS mom_session_id,
-         ms.status        AS session_status,
-         e.id             AS event_id,
-         e.title          AS event_title,
-         e.start_time     AS event_start
-       FROM mom_items mi
-       JOIN mom_sessions ms ON ms.id = mi.mom_session_id
-       JOIN events e        ON e.id  = ms.event_id
-       WHERE
-         (
-           e.organizer_email = $1
-           OR EXISTS (
-             SELECT 1 FROM event_attendees ea
-             WHERE ea.event_id = e.id AND ea.email = $1
-           )
-         )
-         AND (
-           mi.action_item ILIKE $2
-           OR mi.category  ILIKE $2
-         )
-       ORDER BY e.start_time DESC, mi.serial_number ASC
-       LIMIT 100`,
-      [userEmail, `%${q}%`],
-    )
+    >('usp_SearchMOM', {
+      UserEmail: { type: sql.NVarChar(255), value: userEmail },
+      Query:     { type: sql.NVarChar(255), value: q },
+    })
 
     const data = rows.map((r) => ({
       ...formatItem(r),
@@ -170,9 +150,6 @@ momRouter.get('/search', async (req: AuthRequest, res, next) => {
 })
 
 // ─── PATCH /api/mom/item/:itemId ──────────────────────────────────────────────
-//
-// Accepts any combination of: status, category, actionItem, ownerEmail, eta.
-// Syncs to Trello when status or actionItem changes on a linked card.
 
 momRouter.patch('/item/:itemId', async (req: AuthRequest, res, next) => {
   try {
@@ -219,97 +196,63 @@ momRouter.patch('/item/:itemId', async (req: AuthRequest, res, next) => {
       return
     }
 
-    // Fetch item + access check
-    const { rows: itemRows } = await query<
-      MomItemRow & {
-        event_id:        string
-        mom_session_id:  string
-        organizer_email: string
-        is_attendee:     boolean
-      }
-    >(
-      `SELECT
-         mi.id, mi.serial_number, mi.category, mi.action_item,
-         mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id,
-         ms.id            AS mom_session_id,
-         e.id             AS event_id,
-         e.organizer_email,
-         EXISTS (
-           SELECT 1 FROM event_attendees ea
-           WHERE ea.event_id = e.id AND ea.email = $2
-         ) AS is_attendee
-       FROM mom_items mi
-       JOIN mom_sessions ms ON ms.id = mi.mom_session_id
-       JOIN events e        ON e.id  = ms.event_id
-       WHERE mi.id = $1`,
-      [itemId, userEmail],
-    )
-
-    if (!itemRows[0]) {
-      res.status(404).json({
-        success: false,
-        error:   'MOM item not found',
-        code:    'item_not_found',
-        statusCode: 404,
+    let updated: (MomItemRow & {
+      mom_session_id:      string
+      old_status:          'pending' | 'in-progress' | 'completed'
+      old_action_item:     string
+      trello_card_id_hint: string | null
+    })[]
+    try {
+      updated = await execSP<MomItemRow & {
+        mom_session_id:      string
+        old_status:          'pending' | 'in-progress' | 'completed'
+        old_action_item:     string
+        trello_card_id_hint: string | null
+      }>('usp_UpdateMOMItem', {
+        ItemId:       { type: sql.UniqueIdentifier, value: itemId },
+        UserEmail:    { type: sql.NVarChar(255),    value: userEmail },
+        Status:       { type: sql.NVarChar(20),     value: status     ?? null },
+        Category:     { type: sql.NVarChar(255),    value: category   ?? null },
+        ActionItem:   { type: sql.NVarChar(sql.MAX), value: actionItem ?? null },
+        OwnerEmail:   { type: sql.NVarChar(255),    value: ownerEmail ?? null },
+        SetOwnerNull: { type: sql.Bit,               value: ownerEmail === null },
+        Eta:          { type: sql.NVarChar(20),     value: eta ?? null },
+        SetEtaNull:   { type: sql.Bit,               value: eta === null },
       })
-      return
-    }
-
-    const item     = itemRows[0]
-    const isMember = item.organizer_email === userEmail || item.is_attendee
-
-    if (!isMember) {
-      res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
-      return
-    }
-
-    // Build dynamic SET clause — $1 is reserved for itemId in WHERE
-    const setClauses: string[] = ['updated_at = NOW()']
-    const params: unknown[]    = [itemId]
-    let   paramIdx             = 2
-
-    if (status !== undefined) {
-      setClauses.push(`status = $${paramIdx++}`)
-      params.push(status)
-    }
-    if (category !== undefined) {
-      setClauses.push(`category = $${paramIdx++}`)
-      params.push(category)
-    }
-    if (actionItem !== undefined) {
-      setClauses.push(`action_item = $${paramIdx++}`)
-      params.push(actionItem.trim())
-    }
-    if (ownerEmail !== undefined) {
-      setClauses.push(`owner_email = $${paramIdx++}`)
-      params.push(ownerEmail || null)
-    }
-    if (eta !== undefined) {
-      setClauses.push(`eta = $${paramIdx++}`)
-      params.push(eta || null)
-    }
-
-    const { rows: updated } = await query<MomItemRow>(
-      `UPDATE mom_items SET ${setClauses.join(', ')} WHERE id = $1 RETURNING *`,
-      params,
-    )
-
-    const oldStatus     = item.status
-    const oldActionItem = item.action_item
-
-    // ── Non-fatal Trello syncs ────────────────────────────────────────────────
-    if (item.trello_card_id) {
-      // Status changed → move card to Done list + add comment
-      if (status !== undefined && status !== oldStatus) {
-        updateCardStatus(item.trello_card_id, status).catch((err) => {
-          console.warn('[trello] updateCardStatus failed (non-fatal):', err)
+    } catch (err) {
+      const msg = (err as Error).message ?? ''
+      if (msg.includes('NOT_FOUND')) {
+        res.status(404).json({
+          success: false,
+          error:   'MOM item not found',
+          code:    'item_not_found',
+          statusCode: 404,
         })
+        return
       }
-      // Action item text changed → rename the Trello card
+      if (msg.includes('FORBIDDEN')) {
+        res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
+        return
+      }
+      throw err
+    }
+
+    if (!updated[0]) {
+      res.status(404).json({ success: false, error: 'MOM item not found', code: 'item_not_found', statusCode: 404 })
+      return
+    }
+
+    const item          = updated[0]
+    const oldStatus     = item.old_status
+    const oldActionItem = item.old_action_item
+
+    // ── Trello sync removed — log no-op ──────────────────────────────────────
+    if (item.trello_card_id_hint) {
+      if (status !== undefined && status !== oldStatus) {
+        trelloRemoved('updateCardStatus')
+      }
       if (actionItem !== undefined && actionItem.trim() !== oldActionItem) {
-        updateCardName(item.trello_card_id, actionItem.trim()).catch((err) => {
-          console.warn('[trello] updateCardName failed (non-fatal):', err)
-        })
+        trelloRemoved('updateCardName')
       }
     }
 
@@ -337,93 +280,63 @@ momRouter.patch('/item/:itemId', async (req: AuthRequest, res, next) => {
       )
     }
 
-    res.json({ success: true, data: formatItem(updated[0]) })
+    res.json({ success: true, data: formatItem(item) })
   } catch (err) {
     next(err)
   }
 })
 
 // ─── DELETE /api/mom/item/:itemId ─────────────────────────────────────────────
-//
-// Removes a MOM item. Archives the linked Trello card (non-fatal).
-// Re-sequences serial numbers on the remaining items.
 
 momRouter.delete('/item/:itemId', async (req: AuthRequest, res, next) => {
   try {
     const userEmail  = req.user!.email
     const { itemId } = req.params
 
-    // Fetch item + access check
-    const { rows: itemRows } = await query<
-      MomItemRow & {
-        event_id:        string
+    let resultRows: { id: string; mom_session_id: string; trello_card_id: string | null; action_item: string }[]
+    try {
+      resultRows = await execSP<{
+        id:              string
         mom_session_id:  string
-        organizer_email: string
-        is_attendee:     boolean
+        trello_card_id:  string | null
+        action_item:     string
+      }>('usp_DeleteMOMItem', {
+        ItemId:    { type: sql.UniqueIdentifier, value: itemId },
+        UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+      })
+    } catch (err) {
+      const msg = (err as Error).message ?? ''
+      if (msg.includes('NOT_FOUND')) {
+        res.status(404).json({
+          success: false,
+          error:   'MOM item not found',
+          code:    'item_not_found',
+          statusCode: 404,
+        })
+        return
       }
-    >(
-      `SELECT
-         mi.id, mi.serial_number, mi.category, mi.action_item,
-         mi.owner_email, mi.eta, mi.status, mi.trello_card_id, mi.trello_board_id,
-         ms.id            AS mom_session_id,
-         e.id             AS event_id,
-         e.organizer_email,
-         EXISTS (
-           SELECT 1 FROM event_attendees ea
-           WHERE ea.event_id = e.id AND ea.email = $2
-         ) AS is_attendee
-       FROM mom_items mi
-       JOIN mom_sessions ms ON ms.id = mi.mom_session_id
-       JOIN events e        ON e.id  = ms.event_id
-       WHERE mi.id = $1`,
-      [itemId, userEmail],
-    )
+      if (msg.includes('FORBIDDEN')) {
+        res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
+        return
+      }
+      throw err
+    }
 
-    if (!itemRows[0]) {
-      res.status(404).json({
-        success: false,
-        error:   'MOM item not found',
-        code:    'item_not_found',
-        statusCode: 404,
-      })
+    const ctx = resultRows[0]
+    if (!ctx) {
+      res.status(404).json({ success: false, error: 'MOM item not found', code: 'item_not_found', statusCode: 404 })
       return
     }
 
-    const item     = itemRows[0]
-    const isMember = item.organizer_email === userEmail || item.is_attendee
-
-    if (!isMember) {
-      res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
-      return
-    }
-
-    // Delete the item (cascades to mom_item_comments via FK)
-    await query(`DELETE FROM mom_items WHERE id = $1`, [itemId])
-
-    // Re-sequence remaining items in the same session
-    await query(
-      `UPDATE mom_items
-       SET serial_number = sub.new_serial
-       FROM (
-         SELECT id, ROW_NUMBER() OVER (ORDER BY serial_number ASC) AS new_serial
-         FROM mom_items
-         WHERE mom_session_id = $1
-       ) sub
-       WHERE mom_items.id = sub.id`,
-      [item.mom_session_id],
-    )
-
-    // Non-fatal: archive the Trello card
-    if (item.trello_card_id) {
-      archiveCard(item.trello_card_id).catch((err) => {
-        console.warn('[trello] archiveCard failed (non-fatal):', err)
-      })
+    // Trello archive removed — log no-op
+    if (ctx.trello_card_id) {
+      trelloRemoved('archiveCard')
     }
 
     // Activity log (non-fatal)
-    logActivity(item.mom_session_id, userEmail, 'item_deleted', {
+    logActivity(ctx.mom_session_id, userEmail, 'item_deleted', {
       itemId,
-      actionItem: item.action_item,
+      actionItem: ctx.action_item,
     })
 
     res.json({ success: true, data: { id: itemId } })
@@ -459,7 +372,10 @@ momRouter.post('/', async (req: AuthRequest, res, next) => {
 
     const access = await checkEventAccess(eventId, userEmail)
     if (!access) {
-      const { rows: ev } = await query('SELECT id FROM events WHERE id = $1', [eventId])
+      const ev = await query<{ id: string }>(
+        'SELECT id FROM events WHERE id = @id',
+        { id: { type: sql.UniqueIdentifier, value: eventId } },
+      )
       const code = ev[0] ? 403 : 404
       res.status(code).json({
         success: false,
@@ -471,79 +387,65 @@ momRouter.post('/', async (req: AuthRequest, res, next) => {
     }
     const userId = req.user!.userId
 
-    // ── Upsert session + replace all items in a single transaction ────────────
-    const { sessionId, isNew, wasAlreadyFinal } = await withTransaction(async (client) => {
-      const { rows: existing } = await client.query<{ id: string; status: string }>(
-        `SELECT id, status FROM mom_sessions WHERE event_id = $1 ORDER BY created_at DESC LIMIT 1`,
-        [eventId],
-      )
+    // Build items JSON for the SP
+    const itemsJson = JSON.stringify(rawItems.map((it) => ({
+      category:       it.category      ?? '',
+      actionItem:     it.actionItem    ?? '',
+      ownerEmail:     it.ownerEmail    ?? '',
+      eta:            it.eta           ?? '',
+      status:         it.status        ?? 'pending',
+      trelloBoardId:  it.trelloBoardId ?? '',
+    })))
 
-      let sid: string
-      let created     = false
-      let prevStatus  = 'draft'
-      if (existing[0]) {
-        sid        = existing[0].id
-        prevStatus = existing[0].status
-        await client.query(
-          `UPDATE mom_sessions SET status = $1, updated_at = NOW() WHERE id = $2`,
-          [status, sid],
-        )
-      } else {
-        const { rows } = await client.query<{ id: string }>(
-          `INSERT INTO mom_sessions (event_id, status, created_by) VALUES ($1, $2, $3) RETURNING id`,
-          [eventId, status, userId],
-        )
-        sid     = rows[0].id
-        created = true
-      }
-
-      await client.query(`DELETE FROM mom_items WHERE mom_session_id = $1`, [sid])
-
-      for (let i = 0; i < rawItems.length; i++) {
-        const item   = rawItems[i]
-        const serial = i + 1
-        await client.query(
-          `INSERT INTO mom_items
-             (mom_session_id, serial_number, category, action_item, owner_email, eta, status, trello_board_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            sid,
-            serial,
-            item.category      ?? '',
-            item.actionItem    ?? '',
-            item.ownerEmail    ?? null,
-            item.eta           ?? null,
-            item.status        ?? 'pending',
-            item.trelloBoardId ?? null,
-          ],
-        )
-      }
-
-      return { sessionId: sid, isNew: created, wasAlreadyFinal: prevStatus === 'final' }
+    // usp_SaveMOMSession returns 3 recordsets:
+    //   [0] control flags { session_id, is_new, was_already_final }
+    //   [1] session row
+    //   [2] saved items
+    const result = await execSPMulti('usp_SaveMOMSession', {
+      EventId:   { type: sql.UniqueIdentifier, value: eventId },
+      Status:    { type: sql.NVarChar(10),     value: status },
+      UserId:    { type: sql.UniqueIdentifier, value: userId },
+      ItemsJson: { type: sql.NVarChar(sql.MAX), value: itemsJson },
     })
 
-    // ── Trello sync — only on the draft→final transition, not re-saves ──────
+    const flags = (result.recordsets?.[0] ?? []) as {
+      session_id:        string
+      is_new:            number
+      was_already_final: number
+    }[]
+    const sessionRows = (result.recordsets?.[1] ?? []) as {
+      id:         string
+      event_id:   string
+      status:     'draft' | 'final'
+      created_at: Date
+      updated_at: Date
+    }[]
+    const itemRows = (result.recordsets?.[2] ?? []) as MomItemRow[]
+
+    const sessionId       = flags[0].session_id
+    const isNew           = flags[0].is_new === 1
+    const wasAlreadyFinal = flags[0].was_already_final === 1
+
+    // ── Trello sync removed — only emit email + activity on draft→final ──────
     if (status === 'final' && !wasAlreadyFinal) {
-      syncMOMToTrello(sessionId).catch((err) => {
-        console.error('[trello] syncMOMToTrello top-level error:', err)
-      })
+      trelloRemoved('syncMOMToTrello')
 
       // ── Email all attendees ─────────────────────────────────────────────────
       ;(async () => {
         try {
-          const { rows: evRows } = await query<{
+          const evRows = await query<{
             title:           string
             start_time:      Date
             end_time:        Date
             organizer_email: string
           }>(
-            `SELECT title, start_time, end_time, organizer_email FROM events WHERE id = $1`,
-            [eventId],
+            `SELECT title, start_time, end_time, organizer_email FROM events WHERE id = @id`,
+            { id: { type: sql.UniqueIdentifier, value: eventId } },
           )
 
-          const { rows: attendeeRows } = await query<{ email: string }>(
-            `SELECT email FROM event_attendees WHERE event_id = $1`,
-            [eventId],
+          const attendeeRows = await query<{ email: string }>(
+            `SELECT email FROM event_attendees WHERE event_id = @id`,
+            { id: { type: sql.UniqueIdentifier, value: eventId } },
           )
 
           if (evRows[0]) {
@@ -577,24 +479,6 @@ momRouter.post('/', async (req: AuthRequest, res, next) => {
       logActivity(sessionId, userEmail, 'mom_finalized', { itemCount: rawItems.length })
     }
 
-    // ── Return saved session ──────────────────────────────────────────────────
-    const { rows: sessionRows } = await query<{
-      id:         string
-      event_id:   string
-      status:     'draft' | 'final'
-      created_at: Date
-      updated_at: Date
-    }>(
-      `SELECT id, event_id, status, created_at, updated_at FROM mom_sessions WHERE id = $1`,
-      [sessionId],
-    )
-
-    const { rows: itemRows } = await query<MomItemRow>(
-      `SELECT id, serial_number, category, action_item, owner_email, eta, status, trello_card_id, trello_board_id
-       FROM mom_items WHERE mom_session_id = $1 ORDER BY serial_number ASC`,
-      [sessionId],
-    )
-
     const session = sessionRows[0]
     res.json({
       success: true,
@@ -613,9 +497,6 @@ momRouter.post('/', async (req: AuthRequest, res, next) => {
 })
 
 // ─── GET /api/mom/previous/:eventId ──────────────────────────────────────────
-//
-// Returns the most recently finalized MOM from a DIFFERENT event that shares
-// the same title — used to show the "Previous MOM" section.
 
 momRouter.get('/previous/:eventId', async (req: AuthRequest, res, next) => {
   try {
@@ -628,52 +509,41 @@ momRouter.get('/previous/:eventId', async (req: AuthRequest, res, next) => {
       return
     }
 
-    // Resolve the current event title
-    const { rows: evRows } = await query<{ title: string }>(
-      `SELECT title FROM events WHERE id = $1`,
-      [eventId],
-    )
-    if (!evRows[0]) {
-      res.status(404).json({ success: false, error: 'Event not found', code: 'event_not_found', statusCode: 404 })
-      return
+    let result
+    try {
+      result = await execSPMulti('usp_GetPreviousMOM', {
+        EventId:   { type: sql.UniqueIdentifier, value: eventId },
+        UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+      })
+    } catch (err) {
+      if ((err as Error).message?.includes('NOT_FOUND')) {
+        res.status(404).json({ success: false, error: 'Event not found', code: 'event_not_found', statusCode: 404 })
+        return
+      }
+      throw err
     }
 
-    // Find the most recent OTHER event with the same title that has a finalized MOM
-    const { rows: prevRows } = await query<{
-      session_id:  string
-      event_id:    string
-      start_time:  Date
-    }>(
-      `SELECT ms.id AS session_id, e.id AS event_id, e.start_time
-       FROM mom_sessions ms
-       JOIN events e ON e.id = ms.event_id
-       WHERE e.title = $1
-         AND e.id   != $2
-         AND ms.status = 'final'
-       ORDER BY e.start_time DESC
-       LIMIT 1`,
-      [evRows[0].title, eventId],
-    )
+    // SP returns either:
+    //   [0] = [{ session_id: null }]                 (no previous MOM)
+    //   [0] = [{ session_id, event_id, event_start }], [1] = items
+    const headerRows = (result.recordsets?.[0] ?? []) as {
+      session_id:  string | null
+      event_id?:   string
+      event_start?: Date
+    }[]
 
-    if (!prevRows[0]) {
+    if (!headerRows[0] || headerRows[0].session_id === null) {
       res.json({ success: true, data: null })
       return
     }
 
-    const { rows: items } = await query<MomItemRow>(
-      `SELECT id, serial_number, category, action_item, owner_email, eta, status,
-              trello_card_id, trello_board_id
-       FROM mom_items
-       WHERE mom_session_id = $1
-       ORDER BY serial_number ASC`,
-      [prevRows[0].session_id],
-    )
+    const items = (result.recordsets?.[1] ?? []) as MomItemRow[]
 
     res.json({
       success: true,
       data: {
-        eventId:    prevRows[0].event_id,
-        eventStart: prevRows[0].start_time,
+        eventId:    headerRows[0].event_id,
+        eventStart: headerRows[0].event_start,
         items:      items.map(formatItem),
       },
     })
@@ -683,9 +553,6 @@ momRouter.get('/previous/:eventId', async (req: AuthRequest, res, next) => {
 })
 
 // ─── GET /api/mom/:eventId/activity ──────────────────────────────────────────
-//
-// Returns the activity timeline for the latest MOM session of the event.
-// Scoped to event members only.
 
 momRouter.get('/:eventId/activity', async (req: AuthRequest, res, next) => {
   try {
@@ -694,7 +561,10 @@ momRouter.get('/:eventId/activity', async (req: AuthRequest, res, next) => {
 
     const access = await checkEventAccess(eventId, userEmail)
     if (!access) {
-      const { rows: ev } = await query('SELECT id FROM events WHERE id = $1', [eventId])
+      const ev = await query<{ id: string }>(
+        'SELECT id FROM events WHERE id = @id',
+        { id: { type: sql.UniqueIdentifier, value: eventId } },
+      )
       const code = ev[0] ? 403 : 404
       res.status(code).json({
         success: false,
@@ -705,21 +575,19 @@ momRouter.get('/:eventId/activity', async (req: AuthRequest, res, next) => {
       return
     }
 
-    const { rows } = await query<{
+    // usp_GetMOMActivity returns: [0] access flags (from usp_CheckEventAccess), [1] activity rows
+    const result = await execSPMulti('usp_GetMOMActivity', {
+      EventId:   { type: sql.UniqueIdentifier, value: eventId },
+      UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+    })
+
+    const rows = (result.recordsets?.[1] ?? []) as {
       id:          string
       actor_email: string
       event_type:  string
-      details:     Record<string, unknown> | null
+      details:     string | null
       created_at:  Date
-    }>(
-      `SELECT al.id, al.actor_email, al.event_type, al.details, al.created_at
-       FROM mom_activity_log al
-       JOIN mom_sessions ms ON ms.id = al.session_id
-       WHERE ms.event_id = $1
-       ORDER BY al.created_at DESC
-       LIMIT 50`,
-      [eventId],
-    )
+    }[]
 
     res.json({
       success: true,
@@ -727,7 +595,7 @@ momRouter.get('/:eventId/activity', async (req: AuthRequest, res, next) => {
         id:         r.id,
         actorEmail: r.actor_email,
         eventType:  r.event_type,
-        details:    r.details,
+        details:    r.details ? safeJsonParse(r.details) : null,
         createdAt:  r.created_at,
       })),
     })
@@ -736,6 +604,10 @@ momRouter.get('/:eventId/activity', async (req: AuthRequest, res, next) => {
   }
 })
 
+function safeJsonParse(s: string): unknown {
+  try { return JSON.parse(s) } catch { return s }
+}
+
 // ─── GET /api/mom/item/:itemId/comments ──────────────────────────────────────
 
 momRouter.get('/item/:itemId/comments', async (req: AuthRequest, res, next) => {
@@ -743,47 +615,42 @@ momRouter.get('/item/:itemId/comments', async (req: AuthRequest, res, next) => {
     const userEmail  = req.user!.email
     const { itemId } = req.params
 
-    // Verify user has access to the event this item belongs to
-    const { rows: accessRows } = await query<{
-      event_id:        string
-      organizer_email: string
-      is_attendee:     boolean
-    }>(
-      `SELECT e.id AS event_id, e.organizer_email,
-         EXISTS (
-           SELECT 1 FROM event_attendees ea
-           WHERE ea.event_id = e.id AND ea.email = $2
-         ) AS is_attendee
-       FROM mom_items mi
-       JOIN mom_sessions ms ON ms.id = mi.mom_session_id
-       JOIN events e        ON e.id  = ms.event_id
-       WHERE mi.id = $1`,
-      [itemId, userEmail],
-    )
-
-    if (!accessRows[0]) {
-      res.status(404).json({ success: false, error: 'Item not found', code: 'item_not_found', statusCode: 404 })
-      return
-    }
-    const isMember = accessRows[0].organizer_email === userEmail || accessRows[0].is_attendee
-    if (!isMember) {
-      res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
-      return
-    }
-
-    const { rows } = await query<{
+    let rows: {
       id:           string
       author_email: string
       author_name:  string
       comment:      string
       created_at:   Date
-    }>(
-      `SELECT id, author_email, author_name, comment, created_at
-       FROM mom_item_comments
-       WHERE mom_item_id = $1
-       ORDER BY created_at ASC`,
-      [itemId],
-    )
+    }[]
+    try {
+      rows = await execSP<{
+        id:           string
+        author_email: string
+        author_name:  string
+        comment:      string
+        created_at:   Date
+      }>('usp_GetItemComments', {
+        ItemId:    { type: sql.UniqueIdentifier, value: itemId },
+        UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+      })
+    } catch (err) {
+      const msg = (err as Error).message ?? ''
+      if (msg.includes('FORBIDDEN')) {
+        // The SP doesn't distinguish 404 from 403 — replicate the original
+        // semantics by checking whether the item exists.
+        const exists = await query<{ id: string }>(
+          'SELECT id FROM mom_items WHERE id = @id',
+          { id: { type: sql.UniqueIdentifier, value: itemId } },
+        )
+        if (!exists[0]) {
+          res.status(404).json({ success: false, error: 'Item not found', code: 'item_not_found', statusCode: 404 })
+        } else {
+          res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
+        }
+        return
+      }
+      throw err
+    }
 
     res.json({
       success: true,
@@ -813,48 +680,37 @@ momRouter.post('/item/:itemId/comment', async (req: AuthRequest, res, next) => {
       return
     }
 
-    // Verify access
-    const { rows: accessRows } = await query<{
-      organizer_email: string
-      is_attendee:     boolean
-      author_name:     string
-    }>(
-      `SELECT e.organizer_email,
-         EXISTS (
-           SELECT 1 FROM event_attendees ea
-           WHERE ea.event_id = e.id AND ea.email = $2
-         ) AS is_attendee,
-         COALESCE(u.name, $2) AS author_name
-       FROM mom_items mi
-       JOIN mom_sessions ms ON ms.id = mi.mom_session_id
-       JOIN events e        ON e.id  = ms.event_id
-       LEFT JOIN users u    ON u.email = $2
-       WHERE mi.id = $1`,
-      [itemId, userEmail],
-    )
-
-    if (!accessRows[0]) {
-      res.status(404).json({ success: false, error: 'Item not found', code: 'item_not_found', statusCode: 404 })
-      return
-    }
-    const isMember = accessRows[0].organizer_email === userEmail || accessRows[0].is_attendee
-    if (!isMember) {
-      res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
-      return
-    }
-
-    const { rows } = await query<{
+    let rows: {
       id:           string
       author_email: string
       author_name:  string
       comment:      string
       created_at:   Date
-    }>(
-      `INSERT INTO mom_item_comments (mom_item_id, author_email, author_name, comment)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, author_email, author_name, comment, created_at`,
-      [itemId, userEmail, accessRows[0].author_name, comment.trim()],
-    )
+    }[]
+    try {
+      rows = await execSP<{
+        id:           string
+        author_email: string
+        author_name:  string
+        comment:      string
+        created_at:   Date
+      }>('usp_AddItemComment', {
+        ItemId:    { type: sql.UniqueIdentifier, value: itemId },
+        UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+        Comment:   { type: sql.NVarChar(sql.MAX), value: comment },
+      })
+    } catch (err) {
+      const msg = (err as Error).message ?? ''
+      if (msg.includes('NOT_FOUND')) {
+        res.status(404).json({ success: false, error: 'Item not found', code: 'item_not_found', statusCode: 404 })
+        return
+      }
+      if (msg.includes('FORBIDDEN')) {
+        res.status(403).json({ success: false, error: 'Forbidden', code: 'forbidden', statusCode: 403 })
+        return
+      }
+      throw err
+    }
 
     res.status(201).json({
       success: true,
@@ -880,7 +736,10 @@ momRouter.get('/:eventId', async (req: AuthRequest, res, next) => {
 
     const access = await checkEventAccess(eventId, userEmail)
     if (!access) {
-      const { rows: ev } = await query('SELECT id FROM events WHERE id = $1', [eventId])
+      const ev = await query<{ id: string }>(
+        'SELECT id FROM events WHERE id = @id',
+        { id: { type: sql.UniqueIdentifier, value: eventId } },
+      )
       const code = ev[0] ? 403 : 404
       res.status(code).json({
         success: false,
@@ -891,20 +750,19 @@ momRouter.get('/:eventId', async (req: AuthRequest, res, next) => {
       return
     }
 
-    const { rows: sessions } = await query<{
+    // usp_GetMOMSession returns: [0] access flags, [1] session, [2] items
+    const result = await execSPMulti('usp_GetMOMSession', {
+      EventId:   { type: sql.UniqueIdentifier, value: eventId },
+      UserEmail: { type: sql.NVarChar(255),    value: userEmail },
+    })
+
+    const sessions = (result.recordsets?.[1] ?? []) as {
       id:         string
       event_id:   string
       status:     'draft' | 'final'
       created_at: Date
       updated_at: Date
-    }>(
-      `SELECT id, event_id, status, created_at, updated_at
-       FROM mom_sessions
-       WHERE event_id = $1
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [eventId],
-    )
+    }[]
 
     if (!sessions[0]) {
       res.json({ success: true, data: null })
@@ -912,13 +770,7 @@ momRouter.get('/:eventId', async (req: AuthRequest, res, next) => {
     }
 
     const session = sessions[0]
-    const { rows: items } = await query<MomItemRow>(
-      `SELECT id, serial_number, category, action_item, owner_email, eta, status, trello_card_id, trello_board_id
-       FROM mom_items
-       WHERE mom_session_id = $1
-       ORDER BY serial_number ASC`,
-      [session.id],
-    )
+    const items   = (result.recordsets?.[2] ?? []) as MomItemRow[]
 
     res.json({
       success: true,

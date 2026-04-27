@@ -277,10 +277,12 @@ BEGIN
          LEFT JOIN users u2 ON u2.email = ea2.email
          WHERE  ea2.event_id = e.id
          FOR JSON PATH)                          AS attendees_json,
-        -- Departments as JSON array
-        (SELECT DISTINCT tm.trello_board_name AS department
-         FROM   trello_mappings tm
-         WHERE  tm.user_email = e.organizer_email
+        -- Departments derived from attendee user records (Phase 0 — Trello-mapping
+        -- table was removed; Kaarya integration in Phase 3 will provide a richer source).
+        (SELECT DISTINCT u3.department AS department
+         FROM   event_attendees ea3
+         JOIN   users u3 ON u3.email = ea3.email
+         WHERE  ea3.event_id = e.id AND u3.department IS NOT NULL
          FOR JSON PATH)                          AS departments_json,
         -- Latest MOM session
         lm.id           AS mom_session_id,
@@ -1309,83 +1311,10 @@ GO
 
 
 -- ============================================================
---  SECTION 6 — TRELLO MAPPINGS
+--  SECTION 6 — (removed) TRELLO MAPPINGS
+--  Trello integration was removed in Phase 0; replaced by Kaarya app.
+--  The legacy `trello_mappings` table is no longer created by 01_tables.sql.
 -- ============================================================
-
--- ------------------------------------------------------------
--- usp_GetTrelloMappings
--- Called by: GET /api/trello/mappings
--- ------------------------------------------------------------
-CREATE OR ALTER PROCEDURE usp_GetTrelloMappings
-    @UserEmail NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SELECT id, user_email, trello_board_id, trello_board_name,
-           trello_list_id, department_id, is_primary
-    FROM   trello_mappings
-    WHERE  user_email = @UserEmail
-    ORDER BY is_primary DESC, trello_board_name ASC;
-END
-GO
-
--- ------------------------------------------------------------
--- usp_UpsertTrelloMapping
--- Called by: POST /api/trello/mappings
--- ------------------------------------------------------------
-CREATE OR ALTER PROCEDURE usp_UpsertTrelloMapping
-    @UserEmail       NVARCHAR(255),
-    @BoardId         NVARCHAR(255),
-    @BoardName       NVARCHAR(500),
-    @ListId          NVARCHAR(255) = NULL,
-    @DepartmentId    UNIQUEIDENTIFIER = NULL,
-    @IsPrimary       BIT = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    -- If setting as primary, clear other primary flags for this user
-    IF @IsPrimary = 1
-    BEGIN
-        UPDATE trello_mappings
-        SET    is_primary = 0
-        WHERE  user_email = @UserEmail;
-    END
-
-    MERGE trello_mappings AS target
-    USING (SELECT @UserEmail AS user_email, @BoardId AS board_id) AS src
-    ON    target.user_email = src.user_email AND target.trello_board_id = src.board_id
-    WHEN MATCHED THEN
-        UPDATE SET
-            trello_board_name = @BoardName,
-            trello_list_id    = ISNULL(@ListId, trello_list_id),
-            department_id     = ISNULL(@DepartmentId, department_id),
-            is_primary        = @IsPrimary
-    WHEN NOT MATCHED THEN
-        INSERT (id, user_email, trello_board_id, trello_board_name, trello_list_id, department_id, is_primary)
-        VALUES (NEWID(), @UserEmail, @BoardId, @BoardName, @ListId, @DepartmentId, @IsPrimary);
-
-    SELECT id, user_email, trello_board_id, trello_board_name,
-           trello_list_id, department_id, is_primary
-    FROM   trello_mappings
-    WHERE  user_email = @UserEmail AND trello_board_id = @BoardId;
-END
-GO
-
--- ------------------------------------------------------------
--- usp_DeleteTrelloMapping
--- Called by: DELETE /api/trello/mappings/:boardId
--- ------------------------------------------------------------
-CREATE OR ALTER PROCEDURE usp_DeleteTrelloMapping
-    @UserEmail NVARCHAR(255),
-    @BoardId   NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DELETE FROM trello_mappings
-    WHERE  user_email = @UserEmail AND trello_board_id = @BoardId;
-END
-GO
 
 
 -- ============================================================
@@ -1495,14 +1424,10 @@ PRINT '    usp_LogMOMActivity';
 PRINT '  SECTION 5 — Comments (2 SPs)';
 PRINT '    usp_GetItemComments';
 PRINT '    usp_AddItemComment';
-PRINT '  SECTION 6 — Trello (3 SPs)';
-PRINT '    usp_GetTrelloMappings';
-PRINT '    usp_UpsertTrelloMapping';
-PRINT '    usp_DeleteTrelloMapping';
 PRINT '  SECTION 7 — Webhooks (3 SPs)';
 PRINT '    usp_GetWebhookSettings';
 PRINT '    usp_UpsertWebhookSetting';
 PRINT '    usp_GetWebhookByKey';
 PRINT '========================================';
-PRINT 'Total: 37 stored procedures';
+PRINT 'Total: 34 stored procedures';
 PRINT '========================================';

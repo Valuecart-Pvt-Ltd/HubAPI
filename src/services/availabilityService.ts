@@ -1,6 +1,6 @@
 import { google }  from 'googleapis'
 import axios        from 'axios'
-import { query }    from '../db'
+import { execSP, query, sql }    from '../db'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,10 +27,11 @@ function buildGoogleAuth(userId: string, accessToken: string, refreshToken: stri
   client.setCredentials({ access_token: accessToken, refresh_token: refreshToken })
   client.on('tokens', (tokens) => {
     if (!tokens.access_token) return
-    query(
-      `UPDATE users SET google_access_token = $1, google_token_expiry = $2 WHERE id = $3`,
-      [tokens.access_token, tokens.expiry_date ? new Date(tokens.expiry_date) : null, userId],
-    ).catch(() => {})
+    execSP('usp_UpdateGoogleTokens', {
+      UserId:      { type: sql.UniqueIdentifier, value: userId },
+      AccessToken: { type: sql.NVarChar(sql.MAX), value: tokens.access_token },
+      TokenExpiry: { type: sql.DateTime2,         value: tokens.expiry_date ? new Date(tokens.expiry_date) : null },
+    }).catch(() => {})
   })
   return client
 }
@@ -50,20 +51,16 @@ async function refreshMicrosoftToken(userId: string, refreshToken: string): Prom
     params.toString(),
     { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
   )
-  await query(
-    `UPDATE users
-     SET microsoft_access_token = $1,
-         microsoft_token_expiry = $2
-     WHERE id = $3`,
-    [data.access_token, data.expires_in ? new Date(Date.now() + data.expires_in * 1000) : null, userId],
-  ).catch(() => {})
+  await execSP('usp_UpdateMicrosoftTokens', {
+    UserId:       { type: sql.UniqueIdentifier, value: userId },
+    AccessToken:  { type: sql.NVarChar(sql.MAX), value: data.access_token },
+    RefreshToken: { type: sql.NVarChar(sql.MAX), value: null },
+    TokenExpiry:  { type: sql.DateTime2,         value: data.expires_in ? new Date(Date.now() + data.expires_in * 1000) : null },
+  }).catch(() => {})
   return data.access_token as string
 }
 
 // ─── 1. Google free/busy ─────────────────────────────────────────────────────
-//
-// Uses the organizer's Google OAuth client with freebusy.query.
-// Works with the existing calendar.readonly scope.
 
 export async function getGoogleFreeBusy(
   organizerUserId: string,
@@ -74,12 +71,12 @@ export async function getGoogleFreeBusy(
   const result = new Map<string, BusySlot[]>()
   if (!emails.length) return result
 
-  const { rows } = await query<{
+  const rows = await query<{
     google_access_token:  string | null
     google_refresh_token: string | null
   }>(
-    `SELECT google_access_token, google_refresh_token FROM users WHERE id = $1`,
-    [organizerUserId],
+    `SELECT google_access_token, google_refresh_token FROM users WHERE id = @userId`,
+    { userId: { type: sql.UniqueIdentifier, value: organizerUserId } },
   )
   const user = rows[0]
   if (!user?.google_refresh_token) return result
@@ -107,8 +104,6 @@ export async function getGoogleFreeBusy(
 }
 
 // ─── 2. Microsoft free/busy ──────────────────────────────────────────────────
-//
-// Uses /me/calendar/getSchedule — works with existing Calendars.Read scope.
 
 export async function getMicrosoftFreeBusy(
   organizerUserId: string,
@@ -119,14 +114,14 @@ export async function getMicrosoftFreeBusy(
   const result = new Map<string, BusySlot[]>()
   if (!emails.length) return result
 
-  const { rows } = await query<{
+  const rows = await query<{
     microsoft_access_token:  string | null
     microsoft_refresh_token: string | null
     microsoft_token_expiry:  Date   | null
   }>(
     `SELECT microsoft_access_token, microsoft_refresh_token, microsoft_token_expiry
-     FROM users WHERE id = $1`,
-    [organizerUserId],
+     FROM users WHERE id = @userId`,
+    { userId: { type: sql.UniqueIdentifier, value: organizerUserId } },
   )
   const user = rows[0]
   if (!user?.microsoft_access_token) return result
@@ -172,9 +167,6 @@ export async function getMicrosoftFreeBusy(
 }
 
 // ─── 3. Merged free/busy ─────────────────────────────────────────────────────
-//
-// Tries Google first; if no data tries Microsoft.
-// Merges results if organizer has both providers.
 
 export async function getAttendeeAvailability(
   organizerUserId: string,
@@ -198,9 +190,6 @@ export async function getAttendeeAvailability(
 }
 
 // ─── 4. Slot generator ───────────────────────────────────────────────────────
-//
-// Generates 30-minute time slots for a given date (in the given UTC offset).
-// Marks each slot with how many attendees are free vs busy.
 
 export function generateTimeSlots(
   busyMap:         Map<string, BusySlot[]>,

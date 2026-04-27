@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import passport from '../config/passport'
 import '../config/passportMicrosoft'
-import { query } from '../db'
+import { execSP, query, sql } from '../db'
 import { requireAuth, AuthRequest } from '../middleware/auth'
 import { rowToUser } from '../config/passport'
 import { CLIENT_URL } from '../config/urls'
@@ -21,6 +21,13 @@ function signToken(user: User): string {
     avatarUrl: user.avatarUrl,
   }
   return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' })
+}
+
+async function getUserById(userId: string): Promise<Record<string, unknown> | null> {
+  const rows = await execSP<Record<string, unknown>>('usp_GetUserById', {
+    UserId: { type: sql.UniqueIdentifier, value: userId },
+  })
+  return rows[0] ?? null
 }
 
 // ─── Google OAuth ─────────────────────────────────────────────────────────────
@@ -90,65 +97,44 @@ authRouter.get(
   }),
   async (req: AuthRequest, res, next) => {
     try {
-      const state     = (req.query.state as string) ?? ''
-      const googleUser = req.user as User & {
-        googleAccessToken?:  string
-        googleRefreshToken?: string
-        googleId?:           string
-        avatarUrl?:          string
-      }
+      const state      = (req.query.state as string) ?? ''
+      const googleUser = req.user as User
 
-      // Decode the original user's JWT from state
       let originalUserId: string | null = null
       try {
         const payload = jwt.verify(state, process.env.JWT_SECRET!) as AuthTokenPayload
         originalUserId = payload.userId
       } catch {
-        // Invalid state — fall back to returning the Google user's token
         const token = signToken(googleUser)
         return res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
       }
 
-      // Fetch the Google user's tokens from DB (passport already upserted them)
-      const { rows: googleRows } = await query<Record<string, unknown>>(
-        `SELECT google_id, google_access_token, google_refresh_token, avatar_url
-         FROM users WHERE id = $1`,
-        [googleUser.id],
-      )
-      const gRow = googleRows[0]
+      // Read the temporary Google user's tokens (passport upserted them in googleVerify)
+      const gRow = await getUserById(googleUser.id)
       if (!gRow) {
         const token = signToken(googleUser)
         return res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
       }
 
-      // Copy Google tokens onto the original user account
-      await query(
-        `UPDATE users
-         SET google_id            = $1,
-             google_access_token  = $2,
-             google_refresh_token = $3,
-             avatar_url           = COALESCE($4, avatar_url)
-         WHERE id = $5`,
-        [
-          gRow.google_id,
-          gRow.google_access_token,
-          gRow.google_refresh_token,
-          gRow.avatar_url,
-          originalUserId,
-        ],
-      )
+      // Link tokens onto the original account (SP also clears google_id from any
+      // other row that matches — keeps the unique constraint clean).
+      const linked = await execSP<Record<string, unknown>>('usp_LinkGoogleToUser', {
+        OriginalUserId: { type: sql.UniqueIdentifier,   value: originalUserId },
+        GoogleId:       { type: sql.NVarChar(255),      value: gRow.google_id },
+        AvatarUrl:      { type: sql.NVarChar(sql.MAX),  value: gRow.avatar_url },
+        AccessToken:    { type: sql.NVarChar(sql.MAX),  value: gRow.google_access_token },
+        RefreshToken:   { type: sql.NVarChar(sql.MAX),  value: gRow.google_refresh_token },
+        TokenExpiry:    { type: sql.DateTime2,          value: gRow.google_token_expiry ?? null },
+      })
 
-      // Delete the temporary Google user if it's different from the original
+      // Delete the temporary Google user if it's a different row
       if (googleUser.id !== originalUserId) {
-        await query(`DELETE FROM users WHERE id = $1`, [googleUser.id])
+        await query('DELETE FROM users WHERE id = @id', {
+          id: { type: sql.UniqueIdentifier, value: googleUser.id },
+        })
       }
 
-      // Return a fresh token for the original user
-      const { rows: updatedRows } = await query<Record<string, unknown>>(
-        `SELECT * FROM users WHERE id = $1`,
-        [originalUserId],
-      )
-      const token = signToken(rowToUser(updatedRows[0]))
+      const token = signToken(rowToUser(linked[0] ?? gRow))
       res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
     } catch (err) {
       next(err)
@@ -160,11 +146,7 @@ authRouter.get(
 
 authRouter.post('/register', async (req, res, next) => {
   try {
-    const { email, password, name } = req.body as {
-      email: string
-      password: string
-      name: string
-    }
+    const { email, password, name } = req.body as { email: string; password: string; name: string }
 
     if (!email || !password || !name) {
       res.status(400).json({
@@ -176,26 +158,29 @@ authRouter.post('/register', async (req, res, next) => {
       return
     }
 
-    const existing = await query('SELECT id FROM users WHERE email = $1', [email])
-    if (existing.rows.length > 0) {
-      res.status(409).json({
-        success: false,
-        error:   'Email already registered',
-        code:    'email_taken',
-        statusCode: 409,
+    const hash = await bcrypt.hash(password, 12)
+    let rows: Record<string, unknown>[]
+    try {
+      rows = await execSP<Record<string, unknown>>('usp_RegisterUser', {
+        Email:        { type: sql.NVarChar(255),     value: email },
+        Name:         { type: sql.NVarChar(255),     value: name },
+        PasswordHash: { type: sql.NVarChar(sql.MAX), value: hash },
       })
-      return
+    } catch (err) {
+      // SP raises 'EMAIL_TAKEN' for duplicate emails
+      if (err instanceof Error && err.message.includes('EMAIL_TAKEN')) {
+        res.status(409).json({
+          success: false,
+          error:   'Email already registered',
+          code:    'email_taken',
+          statusCode: 409,
+        })
+        return
+      }
+      throw err
     }
 
-    const hash   = await bcrypt.hash(password, 12)
-    const result = await query<Record<string, unknown>>(
-      `INSERT INTO users (email, name, password_hash)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [email, name, hash],
-    )
-
-    const user  = rowToUser(result.rows[0])
+    const user  = rowToUser(rows[0])
     const token = signToken(user)
     res.status(201).json({ success: true, data: { token, user } })
   } catch (err) {
@@ -217,11 +202,10 @@ authRouter.post('/login', async (req, res, next) => {
       return
     }
 
-    const result = await query<Record<string, unknown>>(
-      'SELECT * FROM users WHERE email = $1',
-      [email],
-    )
-    const row = result.rows[0]
+    const rows = await execSP<Record<string, unknown>>('usp_GetUserByEmail', {
+      Email: { type: sql.NVarChar(255), value: email },
+    })
+    const row = rows[0]
 
     if (!row || !row.password_hash) {
       res.status(401).json({
@@ -299,8 +283,8 @@ authRouter.get(
   }),
   async (req: AuthRequest, res, next) => {
     try {
-      const state       = (req.query.state as string) ?? ''
-      const msUser      = req.user as User
+      const state  = (req.query.state as string) ?? ''
+      const msUser = req.user as User
 
       let originalUserId: string | null = null
       try {
@@ -311,39 +295,37 @@ authRouter.get(
         return res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
       }
 
-      // Fetch Microsoft tokens from the upserted user row
-      const { rows: msRows } = await query<Record<string, unknown>>(
-        `SELECT microsoft_id, microsoft_access_token, microsoft_refresh_token, avatar_url
-         FROM users WHERE id = $1`,
-        [msUser.id],
-      )
-      const mRow = msRows[0]
+      const mRow = await getUserById(msUser.id)
       if (!mRow) {
         const token = signToken(msUser)
         return res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
       }
 
-      // Copy Microsoft tokens onto the original user
+      // No SP for Microsoft link — inline T-SQL
       await query(
         `UPDATE users
-         SET microsoft_id            = $1,
-             microsoft_access_token  = $2,
-             microsoft_refresh_token = $3,
-             avatar_url              = COALESCE($4, avatar_url)
-         WHERE id = $5`,
-        [mRow.microsoft_id, mRow.microsoft_access_token, mRow.microsoft_refresh_token, mRow.avatar_url, originalUserId],
+         SET microsoft_id            = @microsoftId,
+             microsoft_access_token  = @accessToken,
+             microsoft_refresh_token = @refreshToken,
+             avatar_url              = ISNULL(@avatarUrl, avatar_url)
+         WHERE id = @userId`,
+        {
+          microsoftId:  { type: sql.NVarChar(255),     value: mRow.microsoft_id },
+          accessToken:  { type: sql.NVarChar(sql.MAX), value: mRow.microsoft_access_token },
+          refreshToken: { type: sql.NVarChar(sql.MAX), value: mRow.microsoft_refresh_token },
+          avatarUrl:    { type: sql.NVarChar(sql.MAX), value: mRow.avatar_url },
+          userId:       { type: sql.UniqueIdentifier,  value: originalUserId },
+        },
       )
 
-      // Delete temp Microsoft user if different
       if (msUser.id !== originalUserId) {
-        await query(`DELETE FROM users WHERE id = $1`, [msUser.id])
+        await query('DELETE FROM users WHERE id = @id', {
+          id: { type: sql.UniqueIdentifier, value: msUser.id },
+        })
       }
 
-      const { rows: updatedRows } = await query<Record<string, unknown>>(
-        `SELECT * FROM users WHERE id = $1`,
-        [originalUserId],
-      )
-      const token = signToken(rowToUser(updatedRows[0]))
+      const updated = await getUserById(originalUserId)
+      const token = signToken(rowToUser(updated ?? mRow))
       res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`)
     } catch (err) {
       next(err)
@@ -362,28 +344,18 @@ authRouter.patch('/profile', requireAuth, async (req: AuthRequest, res, next) =>
       newPassword?:     string
     }
 
-    const { rows } = await query<Record<string, unknown>>(
-      'SELECT * FROM users WHERE id = $1', [userId],
-    )
-    const row = rows[0]
+    const row = await getUserById(userId)
     if (!row) {
       res.status(404).json({ success: false, error: 'User not found', code: 'user_not_found', statusCode: 404 })
       return
     }
 
-    const setClauses: string[] = []
-    const params: unknown[] = []
-    let idx = 1
-
-    if (name !== undefined) {
-      if (!name.trim()) {
-        res.status(400).json({ success: false, error: 'Name cannot be empty', code: 'invalid_name', statusCode: 400 })
-        return
-      }
-      setClauses.push(`name = $${idx++}`)
-      params.push(name.trim())
+    if (name !== undefined && !name.trim()) {
+      res.status(400).json({ success: false, error: 'Name cannot be empty', code: 'invalid_name', statusCode: 400 })
+      return
     }
 
+    let newPasswordHash: string | null = null
     if (newPassword !== undefined) {
       if (!currentPassword) {
         res.status(400).json({ success: false, error: 'Current password is required', code: 'missing_current_password', statusCode: 400 })
@@ -402,23 +374,34 @@ authRouter.patch('/profile', requireAuth, async (req: AuthRequest, res, next) =>
         res.status(400).json({ success: false, error: 'New password must be at least 8 characters', code: 'weak_password', statusCode: 400 })
         return
       }
-      const hash = await bcrypt.hash(newPassword, 12)
-      setClauses.push(`password_hash = $${idx++}`)
-      params.push(hash)
+      newPasswordHash = await bcrypt.hash(newPassword, 12)
     }
 
-    if (setClauses.length === 0) {
+    if (name === undefined && newPasswordHash === null) {
       res.status(400).json({ success: false, error: 'Nothing to update', code: 'nothing_to_update', statusCode: 400 })
       return
     }
 
-    params.push(userId)
-    const { rows: updated } = await query<Record<string, unknown>>(
-      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
-      params,
-    )
+    // Update name via SP; update password_hash inline (SP doesn't cover it)
+    if (name !== undefined) {
+      await execSP('usp_UpdateUserProfile', {
+        UserId: { type: sql.UniqueIdentifier,  value: userId },
+        Name:   { type: sql.NVarChar(255),     value: name.trim() },
+      })
+    }
+    if (newPasswordHash !== null) {
+      await query('UPDATE users SET password_hash = @hash WHERE id = @id', {
+        hash: { type: sql.NVarChar(sql.MAX), value: newPasswordHash },
+        id:   { type: sql.UniqueIdentifier,  value: userId },
+      })
+    }
 
-    res.json({ success: true, data: rowToUser(updated[0]) })
+    const updated = await getUserById(userId)
+    if (!updated) {
+      res.status(500).json({ success: false, error: 'User vanished after update', statusCode: 500 })
+      return
+    }
+    res.json({ success: true, data: rowToUser(updated) })
   } catch (err) {
     next(err)
   }
@@ -439,18 +422,21 @@ authRouter.post('/avatar', requireAuth, async (req: AuthRequest, res, next) => {
       res.status(400).json({ success: false, error: 'Must be a valid image data URL', code: 'invalid_format', statusCode: 400 })
       return
     }
-    // 200×200 JPEG at q=0.7 is ~20-40 KB; 600 000 chars ≈ 450 KB — very generous
     if (avatarDataUrl.length > 600_000) {
       res.status(413).json({ success: false, error: 'Image too large (max ~400 KB)', code: 'image_too_large', statusCode: 413 })
       return
     }
 
-    const { rows } = await query<Record<string, unknown>>(
-      `UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING *`,
-      [avatarDataUrl, userId],
-    )
-
-    res.json({ success: true, data: rowToUser(rows[0]) })
+    await execSP('usp_UpdateUserProfile', {
+      UserId:    { type: sql.UniqueIdentifier, value: userId },
+      AvatarUrl: { type: sql.NVarChar(sql.MAX), value: avatarDataUrl },
+    })
+    const updated = await getUserById(userId)
+    if (!updated) {
+      res.status(404).json({ success: false, error: 'User not found', statusCode: 404 })
+      return
+    }
+    res.json({ success: true, data: rowToUser(updated) })
   } catch (err) {
     next(err)
   }
@@ -460,12 +446,8 @@ authRouter.post('/avatar', requireAuth, async (req: AuthRequest, res, next) => {
 
 authRouter.get('/me', requireAuth, async (req: AuthRequest, res, next) => {
   try {
-    const result = await query<Record<string, unknown>>(
-      'SELECT * FROM users WHERE id = $1',
-      [req.user!.userId],
-    )
-
-    if (!result.rows[0]) {
+    const row = await getUserById(req.user!.userId)
+    if (!row) {
       res.status(404).json({
         success: false,
         error:   'User not found',
@@ -474,8 +456,7 @@ authRouter.get('/me', requireAuth, async (req: AuthRequest, res, next) => {
       })
       return
     }
-
-    res.json({ success: true, data: rowToUser(result.rows[0]) })
+    res.json({ success: true, data: rowToUser(row) })
   } catch (err) {
     next(err)
   }

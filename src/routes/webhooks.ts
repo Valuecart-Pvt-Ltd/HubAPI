@@ -1,12 +1,19 @@
 import { Router, Request, Response }         from 'express'
-import { pool }                               from '../db'
+import { execSP, query, withTransaction, sql } from '../db'
 import { requireAuth, AuthRequest }           from '../middleware/auth'
 import { captureRawBody, webhookSignatureMiddleware } from '../middleware/webhookAuth'
 import { parseReadAI, parseFireflies, normalizeItems } from '../services/transcriptParserService'
-import { syncMOMToTrello }                    from '../services/trelloService'
 import type { ReadAIWebhookPayload, FirefliesWebhookPayload } from '../types/webhooks'
 
 export const webhookRouter = Router()
+
+// ─── Trello compatibility shim ────────────────────────────────────────────────
+// Trello has been removed from this project. The webhook handlers used to
+// fire-and-forget syncMOMToTrello; replace each call with a no-op log.
+
+function trelloRemoved(op: string): void {
+  console.log(`[trello-removed] ${op} — this op is now handled by Kaarya integration in Phase 3`)
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -15,9 +22,9 @@ export const webhookRouter = Router()
  * Returns the user row or null.
  */
 async function resolveWebhookUser(webhookKey: string) {
-  const { rows } = await pool.query<{ user_id: string; provider: string; enabled: boolean }>(
-    `SELECT user_id, provider, enabled FROM webhook_settings WHERE webhook_key = $1`,
-    [webhookKey],
+  const rows = await execSP<{ id: string; user_id: string; provider: string; enabled: boolean; webhook_key: string; user_email: string }>(
+    'usp_GetWebhookByKey',
+    { WebhookKey: { type: sql.UniqueIdentifier, value: webhookKey } },
   )
   return rows[0] ?? null
 }
@@ -32,19 +39,23 @@ async function matchEvent(
   title:  string,
   startTime: string,
 ): Promise<string | null> {
-  // Search events within ±1 day of the meeting start time and fuzzy-match title
-  const { rows } = await pool.query<{ id: string }>(
-    `SELECT e.id
+  // Search events within ±1 day of the meeting start time and fuzzy-match title.
+  // Postgres ILIKE → LOWER(...) LIKE LOWER(...) for T-SQL.
+  const rows = await query<{ id: string }>(
+    `SELECT TOP 1 e.id
        FROM events e
        JOIN event_attendees ea ON ea.event_id = e.id
        JOIN users u ON u.id = ea.user_id
-      WHERE u.id = $1
-        AND e.start_time::date BETWEEN ($2::timestamptz - INTERVAL '1 day')::date
-                                   AND ($2::timestamptz + INTERVAL '1 day')::date
-        AND e.title ILIKE $3
-      ORDER BY ABS(EXTRACT(EPOCH FROM (e.start_time - $2::timestamptz)))
-      LIMIT 1`,
-    [userId, startTime, `%${title.replace(/%/g, '\\%')}%`],
+      WHERE u.id = @userId
+        AND CAST(e.start_time AS DATE) BETWEEN DATEADD(DAY, -1, CAST(@startTime AS DATETIME2))
+                                           AND DATEADD(DAY,  1, CAST(@startTime AS DATETIME2))
+        AND LOWER(e.title) LIKE LOWER(@titleLike)
+      ORDER BY ABS(DATEDIFF(SECOND, e.start_time, CAST(@startTime AS DATETIME2)))`,
+    {
+      userId:    { type: sql.UniqueIdentifier, value: userId },
+      startTime: { type: sql.NVarChar(50),     value: startTime },
+      titleLike: { type: sql.NVarChar(500),    value: `%${title.replace(/%/g, '\\%')}%` },
+    },
   )
   return rows[0]?.id ?? null
 }
@@ -58,68 +69,67 @@ async function upsertDraftMOM(
   userId:  string,
   items:   ReturnType<typeof normalizeItems>,
 ): Promise<string> {
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
+  return withTransaction(async (tx) => {
+    const r = new sql.Request(tx)
 
-    // Upsert mom_sessions — keep existing final sessions untouched
-    const { rows: sessionRows } = await client.query<{ id: string; status: string }>(
-      `SELECT id, status FROM mom_sessions WHERE event_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [eventId],
+    // Look up the latest session for this event
+    r.input('eventId', sql.UniqueIdentifier, eventId)
+    const existingResult = await r.query<{ id: string; status: string }>(
+      `SELECT TOP 1 id, status FROM mom_sessions WHERE event_id = @eventId ORDER BY created_at DESC`,
     )
+    const existing = existingResult.recordset
 
-    let sessionId: string
-
-    if (sessionRows[0]?.status === 'final') {
+    if (existing[0]?.status === 'final') {
       // Already finalised — do not overwrite; just return existing ID
-      await client.query('ROLLBACK')
-      return sessionRows[0].id
+      return existing[0].id
     }
 
-    if (sessionRows[0]) {
-      sessionId = sessionRows[0].id
-      // Delete existing draft items to replace them
-      await client.query(`DELETE FROM mom_items WHERE mom_session_id = $1`, [sessionId])
-      await client.query(
-        `UPDATE mom_sessions SET updated_at = NOW() WHERE id = $1`,
-        [sessionId],
-      )
+    let sessionId: string
+    if (existing[0]) {
+      sessionId = existing[0].id
+      const r2 = new sql.Request(tx)
+      r2.input('sessionId', sql.UniqueIdentifier, sessionId)
+      await r2.query(`DELETE FROM mom_items WHERE mom_session_id = @sessionId`)
+
+      const r3 = new sql.Request(tx)
+      r3.input('sessionId', sql.UniqueIdentifier, sessionId)
+      await r3.query(`UPDATE mom_sessions SET updated_at = SYSUTCDATETIME() WHERE id = @sessionId`)
     } else {
-      const { rows } = await client.query<{ id: string }>(
-        `INSERT INTO mom_sessions (event_id, status, created_by)
-              VALUES ($1, 'draft', $2) RETURNING id`,
-        [eventId, userId],
-      )
-      sessionId = rows[0].id
+      sessionId = await (async () => {
+        const r4 = new sql.Request(tx)
+        r4.input('eventId', sql.UniqueIdentifier, eventId)
+        r4.input('userId',  sql.UniqueIdentifier, userId)
+        const inserted = await r4.query<{ id: string }>(
+          `INSERT INTO mom_sessions (id, event_id, status, created_by)
+           OUTPUT inserted.id
+           VALUES (NEWID(), @eventId, 'draft', @userId)`,
+        )
+        return inserted.recordset[0].id
+      })()
     }
 
     // Insert items
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
-      await client.query(
+      const r5 = new sql.Request(tx)
+      r5.input('sessionId',    sql.UniqueIdentifier, sessionId)
+      r5.input('serial',       sql.Int,               i + 1)
+      r5.input('category',     sql.NVarChar(255),    item.category)
+      r5.input('actionItem',   sql.NVarChar(sql.MAX), item.action_item)
+      r5.input('ownerEmail',   sql.NVarChar(255),    item.owner_email)
+      r5.input('eta',          sql.NVarChar(20),     item.eta)
+      r5.input('status',       sql.NVarChar(20),     item.status)
+      await r5.query(
         `INSERT INTO mom_items
-           (mom_session_id, serial_number, category, action_item, owner_email, eta, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          sessionId,
-          i + 1,
-          item.category,
-          item.action_item,
-          item.owner_email,
-          item.eta,
-          item.status,
-        ],
+           (id, mom_session_id, serial_number, category, action_item, owner_email, eta, status)
+         VALUES (NEWID(), @sessionId, @serial, @category, @actionItem, @ownerEmail,
+                 CASE WHEN @eta IS NULL OR @eta = '' THEN NULL ELSE CAST(@eta AS DATE) END,
+                 @status)`,
       )
     }
 
-    await client.query('COMMIT')
     return sessionId
-  } catch (err) {
-    await client.query('ROLLBACK')
-    throw err
-  } finally {
-    client.release()
-  }
+  })
 }
 
 // ─── POST /api/webhooks/readai/:webhookKey ────────────────────────────────────
@@ -151,10 +161,8 @@ webhookRouter.post(
 
       const sessionId = await upsertDraftMOM(eventId, setting.user_id, items)
 
-      // Fire-and-forget Trello sync
-      syncMOMToTrello(sessionId).catch((err) =>
-        console.error('[webhook/readai] Trello sync error:', err),
-      )
+      // Trello sync removed — log no-op
+      trelloRemoved('syncMOMToTrello (readai webhook)')
 
       res.json({ received: true, matched: true, eventId, sessionId, itemCount: items.length })
     } catch (err) {
@@ -192,9 +200,8 @@ webhookRouter.post(
 
       const sessionId = await upsertDraftMOM(eventId, setting.user_id, items)
 
-      syncMOMToTrello(sessionId).catch((err) =>
-        console.error('[webhook/fireflies] Trello sync error:', err),
-      )
+      // Trello sync removed — log no-op
+      trelloRemoved('syncMOMToTrello (fireflies webhook)')
 
       res.json({ received: true, matched: true, eventId, sessionId, itemCount: items.length })
     } catch (err) {
@@ -209,14 +216,17 @@ webhookRouter.post(
 webhookRouter.get('/settings', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.userId
 
-  const { rows } = await pool.query<{
-    provider: string; enabled: boolean; webhook_key: string
+  const rows = await execSP<{
+    id:          string
+    user_id:     string
+    provider:    string
+    enabled:     boolean
+    webhook_key: string
+    created_at:  Date
+    updated_at:  Date
   }>(
-    `SELECT provider, enabled, webhook_key
-       FROM webhook_settings
-      WHERE user_id = $1
-      ORDER BY provider`,
-    [userId],
+    'usp_GetWebhookSettings',
+    { UserId: { type: sql.UniqueIdentifier, value: userId } },
   )
 
   // Return settings for all known providers, inserting defaults for any missing
@@ -253,12 +263,13 @@ webhookRouter.patch(
       return
     }
 
-    const { rows } = await pool.query<{ provider: string; enabled: boolean; webhook_key: string }>(
-      `INSERT INTO webhook_settings (user_id, provider, enabled)
-            VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, provider) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
-       RETURNING provider, enabled, webhook_key`,
-      [userId, provider, enabled],
+    const rows = await execSP<{ provider: string; enabled: boolean; webhook_key: string }>(
+      'usp_UpsertWebhookSetting',
+      {
+        UserId:   { type: sql.UniqueIdentifier, value: userId },
+        Provider: { type: sql.NVarChar(50),      value: provider },
+        Enabled:  { type: sql.Bit,                value: enabled },
+      },
     )
 
     res.json({
@@ -284,13 +295,22 @@ webhookRouter.post(
       return
     }
 
-    const { rows } = await pool.query<{ webhook_key: string }>(
-      `INSERT INTO webhook_settings (user_id, provider, enabled)
-            VALUES ($1, $2, false)
-       ON CONFLICT (user_id, provider) DO UPDATE
-         SET webhook_key = gen_random_uuid(), updated_at = NOW()
-       RETURNING webhook_key`,
-      [userId, provider],
+    // Inline T-SQL — no SP exists for "rotate webhook key". Insert if missing,
+    // otherwise rotate the key and bump updated_at.
+    const rows = await query<{ webhook_key: string }>(
+      `MERGE webhook_settings AS target
+       USING (SELECT @userId AS user_id, @provider AS provider) AS src
+         ON target.user_id = src.user_id AND target.provider = src.provider
+       WHEN MATCHED THEN
+         UPDATE SET webhook_key = NEWID(), updated_at = SYSUTCDATETIME()
+       WHEN NOT MATCHED THEN
+         INSERT (id, user_id, provider, enabled, webhook_key)
+         VALUES (NEWID(), @userId, @provider, 0, NEWID())
+       OUTPUT inserted.webhook_key;`,
+      {
+        userId:   { type: sql.UniqueIdentifier, value: userId },
+        provider: { type: sql.NVarChar(50),      value: provider },
+      },
     )
 
     res.json({ webhookKey: rows[0].webhook_key })

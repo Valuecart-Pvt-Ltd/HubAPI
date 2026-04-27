@@ -180,31 +180,10 @@ BEGIN
 END
 GO
 
--- ─── 8. trello_mappings ───────────────────────────────────────────────────────
--- Migration 002: trello_list_id nullable, unique on (user_email, trello_board_id)
--- Migration 005: is_primary flag
-
-IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'trello_mappings')
-BEGIN
-    CREATE TABLE trello_mappings (
-        id                UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
-        user_email        NVARCHAR(255)    NOT NULL,
-        trello_board_id   NVARCHAR(255)    NOT NULL,
-        trello_board_name NVARCHAR(500)    NOT NULL,
-        trello_list_id    NVARCHAR(255)    NULL,               -- nullable (migration 002)
-        department_id     UNIQUEIDENTIFIER NULL,
-        is_primary        BIT              NOT NULL DEFAULT 0,  -- migration 005
-        CONSTRAINT UQ_trello_mappings_user_board
-            UNIQUE (user_email, trello_board_id),
-        CONSTRAINT FK_trello_mappings_dept
-            FOREIGN KEY (department_id) REFERENCES departments (id)
-    );
-    CREATE INDEX IX_trello_mappings_user_email  ON trello_mappings (user_email);
-    CREATE INDEX IX_trello_mappings_board_id    ON trello_mappings (trello_board_id);
-    CREATE INDEX IX_trello_mappings_dept_id     ON trello_mappings (department_id);
-    PRINT 'Created table: trello_mappings';
-END
-GO
+-- ─── 8. (removed) trello_mappings ─────────────────────────────────────────────
+-- Trello integration was removed in Phase 0; replaced by the Kaarya app.
+-- Legacy `trello_*` columns on users/events/mom_items are kept for migration
+-- safety but are no longer written to.
 
 -- ─── 9. webhook_settings ──────────────────────────────────────────────────────
 -- Migration 003
