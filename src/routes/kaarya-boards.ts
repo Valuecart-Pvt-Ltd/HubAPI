@@ -95,6 +95,45 @@ boardsRouter.get('/boards/:boardId/activity', requireAuth, async (req: AuthReque
   } catch (err) { next(err) }
 })
 
+// ─── Phase 4d — Board labels catalog ─────────────────────────────────────────
+
+boardsRouter.get('/boards/:boardId/labels', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const rows = await execSP('usp_KGetBoardLabels', {
+      BoardId: { type: sql.UniqueIdentifier, value: req.params.boardId },
+      UserId:  { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: rows })
+  } catch (err) { next(err) }
+})
+
+boardsRouter.post('/boards/:boardId/labels', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { name, color } = req.body as { name?: string, color?: string }
+    if (!name || !name.trim() || !color) {
+      res.status(400).json({ success: false, error: 'name and color are required', code: 'missing_fields', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KCreateLabel', {
+      BoardId: { type: sql.UniqueIdentifier, value: req.params.boardId },
+      Name:    { type: sql.NVarChar(100),    value: name.trim() },
+      Color:   { type: sql.NVarChar(20),     value: color },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.status(201).json({ success: true, data: rows[0] })
+  } catch (err) { next(err) }
+})
+
+boardsRouter.delete('/labels/:labelId', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    await execSP('usp_KDeleteLabel', {
+      LabelId: { type: sql.UniqueIdentifier, value: req.params.labelId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: null })
+  } catch (err) { next(err) }
+})
+
 // ─── Phase 4b — board analytics (5 recordsets in one round-trip) ─────────────
 
 boardsRouter.get('/boards/:boardId/analytics', requireAuth, async (req: AuthRequest, res, next) => {

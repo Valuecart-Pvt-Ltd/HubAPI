@@ -54,3 +54,14 @@ workspacesRouter.post('/', requireAuth, async (req: AuthRequest, res, next) => {
     res.status(201).json({ success: true, data: shape(rows[0]) })
   } catch (err) { next(err) }
 })
+
+// GET /api/workspaces/:wsId/users  — for the card-member assignment picker
+workspacesRouter.get('/:wsId/users', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const rows = await execSP('usp_KGetWorkspaceUsers', {
+      WorkspaceId: { type: sql.UniqueIdentifier, value: req.params.wsId },
+      UserId:      { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: rows })
+  } catch (err) { next(err) }
+})

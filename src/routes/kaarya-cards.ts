@@ -260,3 +260,61 @@ cardsRouter.delete('/tasks/:taskId', requireAuth, async (req: AuthRequest, res, 
     res.json({ success: true, data: { id: req.params.taskId } })
   } catch (err) { next(err) }
 })
+
+// ─── Phase 4d — Card members ─────────────────────────────────────────────────
+
+cardsRouter.post('/cards/:cardId/members', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { userId } = req.body as { userId?: string }
+    if (!userId) {
+      res.status(400).json({ success: false, error: 'userId is required', code: 'missing_userId', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KAddCardMember', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      UserId:  { type: sql.UniqueIdentifier, value: userId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.status(201).json({ success: true, data: rows[0] ?? null })
+  } catch (err) { next(err) }
+})
+
+cardsRouter.delete('/cards/:cardId/members/:userId', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    await execSP('usp_KRemoveCardMember', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      UserId:  { type: sql.UniqueIdentifier, value: req.params.userId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: null })
+  } catch (err) { next(err) }
+})
+
+// ─── Phase 4d — Card label assignments (board labels managed in kaarya-boards.ts) ──
+
+cardsRouter.post('/cards/:cardId/labels', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const { labelId } = req.body as { labelId?: string }
+    if (!labelId) {
+      res.status(400).json({ success: false, error: 'labelId is required', code: 'missing_labelId', statusCode: 400 })
+      return
+    }
+    const rows = await execSP('usp_KAddCardLabel', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      LabelId: { type: sql.UniqueIdentifier, value: labelId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.status(201).json({ success: true, data: rows[0] ?? null })
+  } catch (err) { next(err) }
+})
+
+cardsRouter.delete('/cards/:cardId/labels/:labelId', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    await execSP('usp_KRemoveCardLabel', {
+      CardId:  { type: sql.UniqueIdentifier, value: req.params.cardId },
+      LabelId: { type: sql.UniqueIdentifier, value: req.params.labelId },
+      ActorId: { type: sql.UniqueIdentifier, value: req.user!.userId },
+    })
+    res.json({ success: true, data: null })
+  } catch (err) { next(err) }
+})
